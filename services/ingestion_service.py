@@ -141,6 +141,22 @@ class IngestionService:
                     # Get user info
                     user_info = self.slack.get_user_info(access_token, msg["user"]) if msg.get("user") else {}
 
+                    # Build full content including thread replies
+                    full_content = msg["text"]
+
+                    # If message has replies, fetch and append them
+                    if msg.get("reply_count", 0) > 0:
+                        try:
+                            thread_replies = self.slack.fetch_thread_replies(
+                                access_token=access_token,
+                                channel_id=channel_id,
+                                thread_ts=msg["ts"]
+                            )
+                            if thread_replies:
+                                full_content += "\n\n--- Thread Replies ---\n" + "\n\n".join(thread_replies)
+                        except Exception as e:
+                            print(f"Could not fetch thread replies for message {msg['ts']}: {e}")
+
                     # Create document
                     doc_data = {
                         "org_id": org_id,
@@ -148,7 +164,7 @@ class IngestionService:
                         "source_type": "slack",
                         "source_id": source_id,
                         "title": f"Message in #{channel_name}",
-                        "content": msg["text"],
+                        "content": full_content,
                         "author": user_info.get("real_name") or user_info.get("name"),
                         "author_id": msg.get("user"),
                         "channel_name": channel_name,
@@ -196,6 +212,10 @@ class IngestionService:
             self.supabase.table("connections").update({
                 "last_sync_at": datetime.utcnow().isoformat()
             }).eq("id", connection_id).execute()
+
+            # Invalidate embeddings cache since new documents were added
+            from services.rag_service import invalidate_embeddings_cache
+            invalidate_embeddings_cache(org_id)
 
             print(f"\n=== Sync Complete ===")
             print(f"Fetched: {total_fetched} messages")
@@ -292,11 +312,15 @@ class IngestionService:
             .eq("org_id", org_id)\
             .execute()
 
+        print(f"[INGEST] DEBUG: Found {len(result.data) if result.data else 0} embeddings for org {org_id}")
+
         if not result.data:
+            print("[INGEST] DEBUG: No embeddings found, returning empty list")
             return []
 
         # Calculate cosine similarity in Python
         similarities = []
+        max_similarity = 0
         for item in result.data:
             # Convert embedding from database format to numpy array
             # Database may return it as string or list, handle both
@@ -306,12 +330,14 @@ class IngestionService:
                 embedding = json.loads(embedding)
             doc_vector = np.array(embedding, dtype=np.float32)
 
-            # Calculate cosine similarity
+            # Calculate cosine similarity with zero-division protection
             # similarity = (A · B) / (||A|| * ||B||)
             dot_product = np.dot(query_vector, doc_vector)
             norm_query = np.linalg.norm(query_vector)
             norm_doc = np.linalg.norm(doc_vector)
-            similarity = dot_product / (norm_query * norm_doc)
+            similarity = dot_product / max(norm_query * norm_doc, 1e-8)
+
+            max_similarity = max(max_similarity, similarity)
 
             # Only include if above threshold
             if similarity > threshold:
@@ -322,8 +348,12 @@ class IngestionService:
                     "metadata": item.get("metadata", {})
                 })
 
+        print(f"[INGEST] DEBUG: Max similarity found: {max_similarity:.4f}, threshold: {threshold}")
+        print(f"[INGEST] DEBUG: Found {len(similarities)} documents above threshold")
+
         # Sort by similarity (highest first) and limit results
         similarities.sort(key=lambda x: x["similarity"], reverse=True)
+        print(f"[INGEST] DEBUG: Returning top {min(len(similarities), limit)} results")
         return similarities[:limit]
 
 

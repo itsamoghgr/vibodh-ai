@@ -204,7 +204,7 @@ class ChatMessageResponse(BaseModel):
 class ChatStreamRequest(BaseModel):
     query: str
     org_id: str
-    user_id: str
+    user_id: Optional[str] = None  # Optional for memory personalization
     session_id: Optional[str] = None  # Create new session if not provided
     max_context_items: int = Field(default=5, ge=1, le=10)
 

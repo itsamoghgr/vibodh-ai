@@ -212,10 +212,67 @@ class SlackConnector:
                 if msg.get("bot_id"):  # Skip bot messages
                     continue
 
+                # Extract full message content including blocks and attachments
+                full_text = msg.get("text", "")
+
+                # Replace user mentions with names (if we can resolve them)
+                # Slack format: <@U1234567> should become @username
+                # We'll keep the raw format for now since resolving would require extra API calls
+                # But we'll clean up the formatting to make it more readable
+                if full_text:
+                    # Remove angle brackets from mentions
+                    import re
+                    full_text = re.sub(r'<@(U[A-Z0-9]+)>', r'@\1', full_text)
+                    full_text = re.sub(r'<#(C[A-Z0-9]+)\|([^>]+)>', r'#\2', full_text)  # Channel mentions
+                    full_text = re.sub(r'<(https?://[^>]+)>', r'\1', full_text)  # URLs
+
+                # Extract text from blocks (rich formatting)
+                if msg.get("blocks"):
+                    block_texts = []
+                    for block in msg["blocks"]:
+                        if block.get("type") == "rich_text":
+                            # Extract from rich_text elements
+                            for element in block.get("elements", []):
+                                if element.get("type") == "rich_text_section":
+                                    for item in element.get("elements", []):
+                                        if item.get("type") == "text":
+                                            block_texts.append(item.get("text", ""))
+                        elif block.get("type") == "section" and block.get("text"):
+                            block_texts.append(block["text"].get("text", ""))
+
+                    if block_texts:
+                        full_text = full_text + "\n" + "\n".join(block_texts) if full_text else "\n".join(block_texts)
+
+                # Extract attachment text
+                if msg.get("attachments"):
+                    attachment_texts = []
+                    for att in msg["attachments"]:
+                        if att.get("text"):
+                            attachment_texts.append(att["text"])
+                        if att.get("pretext"):
+                            attachment_texts.append(att["pretext"])
+                        if att.get("fallback"):
+                            attachment_texts.append(att["fallback"])
+
+                    if attachment_texts:
+                        full_text = full_text + "\n" + "\n".join(attachment_texts) if full_text else "\n".join(attachment_texts)
+
+                # Extract file information
+                if msg.get("files"):
+                    file_info = []
+                    for file in msg["files"]:
+                        file_name = file.get("name", "")
+                        file_title = file.get("title", "")
+                        if file_name or file_title:
+                            file_info.append(f"[File: {file_title or file_name}]")
+
+                    if file_info:
+                        full_text = full_text + "\n" + "\n".join(file_info) if full_text else "\n".join(file_info)
+
                 filtered_messages.append({
                     "ts": msg["ts"],
                     "user": msg.get("user"),
-                    "text": msg.get("text", ""),
+                    "text": full_text.strip(),
                     "thread_ts": msg.get("thread_ts"),
                     "reply_count": msg.get("reply_count", 0)
                 })
@@ -228,6 +285,67 @@ class SlackConnector:
                 raise Exception(f"Bot is not in channel {channel_id}. Please invite the bot to the channel using '/invite @YourApp' in Slack, or add 'channels:history' scope to your Slack app.")
             else:
                 raise Exception(f"Failed to fetch messages: {error_code}")
+
+    def fetch_thread_replies(
+        self,
+        access_token: str,
+        channel_id: str,
+        thread_ts: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch replies in a thread
+
+        Args:
+            access_token: Slack access token
+            channel_id: Channel ID
+            thread_ts: Thread timestamp
+
+        Returns:
+            List of reply messages
+        """
+        client = WebClient(token=access_token)
+
+        try:
+            response = client.conversations_replies(
+                channel=channel_id,
+                ts=thread_ts
+            )
+
+            # Skip the parent message (first in list)
+            replies = response["messages"][1:] if len(response["messages"]) > 1 else []
+
+            # Extract text from replies
+            reply_texts = []
+            for reply in replies:
+                if reply.get("bot_id"):  # Skip bot messages
+                    continue
+
+                text = reply.get("text", "")
+
+                # Extract from blocks if present
+                if reply.get("blocks"):
+                    block_texts = []
+                    for block in reply["blocks"]:
+                        if block.get("type") == "rich_text":
+                            for element in block.get("elements", []):
+                                if element.get("type") == "rich_text_section":
+                                    for item in element.get("elements", []):
+                                        if item.get("type") == "text":
+                                            block_texts.append(item.get("text", ""))
+                        elif block.get("type") == "section" and block.get("text"):
+                            block_texts.append(block["text"].get("text", ""))
+
+                    if block_texts:
+                        text = text + "\n" + "\n".join(block_texts) if text else "\n".join(block_texts)
+
+                if text.strip():
+                    reply_texts.append(text.strip())
+
+            return reply_texts
+
+        except SlackApiError as e:
+            print(f"Failed to fetch thread replies: {e.response['error']}")
+            return []
 
     def get_user_info(self, access_token: str, user_id: str) -> Dict[str, Any]:
         """

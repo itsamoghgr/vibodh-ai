@@ -311,7 +311,7 @@ async def chat_query(request: ChatQueryRequest):
             query=request.query,
             org_id=request.org_id,
             limit=request.max_context_items,
-            threshold=0.7
+            threshold=0.3  # Lowered from 0.7 to get more results
         )
 
         if not context_items:
@@ -357,8 +357,8 @@ async def chat_stream(request: ChatStreamRequest):
 
         # Create or get session
         session_id = request.session_id
-        if not session_id:
-            # Create new session
+        if not session_id and request.user_id:
+            # Only create session if user_id is provided
             session_data = {
                 "org_id": request.org_id,
                 "user_id": request.user_id,
@@ -367,21 +367,28 @@ async def chat_stream(request: ChatStreamRequest):
             session = supabase.table("chat_sessions").insert(session_data).execute()
             session_id = session.data[0]["id"]
 
-        # Store user message
-        user_message = {
-            "session_id": session_id,
-            "role": "user",
-            "content": request.query
-        }
-        supabase.table("chat_messages").insert(user_message).execute()
+        # Store user message (only if session exists)
+        if session_id:
+            user_message = {
+                "session_id": session_id,
+                "role": "user",
+                "content": request.query
+            }
+            supabase.table("chat_messages").insert(user_message).execute()
 
-        # Get context for metadata
-        rag_service_instance = get_rag_service(supabase)
-        context_items = rag_service_instance.retrieve_context(
-            query=request.query,
-            org_id=request.org_id,
-            limit=request.max_context_items
-        )
+        # Check if simple query
+        simple_queries = ["hi", "hello", "hey", "thanks", "thank you", "bye", "goodbye", "ok", "okay"]
+        is_simple_query = request.query.lower().strip() in simple_queries or len(request.query.strip()) < 10
+
+        # Get context for metadata (skip for simple queries)
+        context_items = []
+        if not is_simple_query:
+            rag_service_instance = get_rag_service(supabase)
+            context_items = rag_service_instance.retrieve_context(
+                query=request.query,
+                org_id=request.org_id,
+                limit=request.max_context_items
+            )
 
         # Generate streaming response
         async def generate():
@@ -391,26 +398,29 @@ async def chat_stream(request: ChatStreamRequest):
             # Send session_id first
             yield f"data: {json.dumps({'session_id': session_id, 'type': 'session'})}\n\n"
 
-            # Send context
-            yield f"data: {json.dumps({'type': 'context', 'context': context_items})}\n\n"
+            # Send context (only if not a simple query and has context)
+            if context_items:
+                yield f"data: {json.dumps({'type': 'context', 'context': context_items})}\n\n"
 
-            # Stream answer
+            # Stream answer (with user_id for memory personalization)
             async for chunk in rag_service.generate_answer_stream(
                 query=request.query,
                 org_id=request.org_id,
-                max_context_items=request.max_context_items
+                max_context_items=request.max_context_items,
+                user_id=request.user_id
             ):
                 full_response += chunk
                 yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
 
-            # Store assistant message
-            assistant_message = {
-                "session_id": session_id,
-                "role": "assistant",
-                "content": full_response,
-                "context": context_items
-            }
-            supabase.table("chat_messages").insert(assistant_message).execute()
+            # Store assistant message (only if session exists)
+            if session_id:
+                assistant_message = {
+                    "session_id": session_id,
+                    "role": "assistant",
+                    "content": full_response,
+                    "context": context_items if context_items else []
+                }
+                supabase.table("chat_messages").insert(assistant_message).execute()
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -547,6 +557,288 @@ async def list_documents(org_id: str = Query(...), limit: int = 100):
         return {"documents": result.data, "total": len(result.data)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch documents: {str(e)}")
+
+@app.delete("/api/documents/cleanup")
+async def cleanup_slack_documents(org_id: str = Query(...)):
+    """Delete all Slack documents and embeddings for an organization"""
+    try:
+        # Get all Slack document IDs
+        docs = supabase.table("documents")\
+            .select("id")\
+            .eq("org_id", org_id)\
+            .eq("source_type", "slack")\
+            .execute()
+
+        doc_ids = [doc["id"] for doc in docs.data] if docs.data else []
+
+        if not doc_ids:
+            return {"message": "No Slack documents to delete", "deleted": 0}
+
+        # Delete embeddings first (to avoid foreign key issues)
+        for doc_id in doc_ids:
+            supabase.table("embeddings")\
+                .delete()\
+                .eq("document_id", doc_id)\
+                .execute()
+
+        # Delete documents
+        supabase.table("documents")\
+            .delete()\
+            .eq("org_id", org_id)\
+            .eq("source_type", "slack")\
+            .execute()
+
+        return {"message": f"Deleted {len(doc_ids)} Slack documents and their embeddings", "deleted": len(doc_ids)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to cleanup documents: {str(e)}")
+
+@app.get("/api/slack/message-count")
+async def get_slack_message_count(connection_id: str = Query(...), days_back: int = 30):
+    """
+    Check directly with Slack API to count total messages across all channels
+    This provides a diagnostic view of what should be synced
+    """
+    try:
+        # Get connection
+        connection = supabase.table("connections")\
+            .select("*")\
+            .eq("id", connection_id)\
+            .single()\
+            .execute()
+
+        if not connection.data:
+            raise HTTPException(status_code=404, detail="Connection not found")
+
+        access_token = connection.data["access_token"]
+        org_id = connection.data["org_id"]
+
+        slack = get_slack_connector()
+
+        from datetime import timedelta
+        oldest = (datetime.now() - timedelta(days=days_back)).timestamp()
+
+        # Get all channels (public and private)
+        public_channels = slack.list_channels(access_token, types="public_channel", auto_join=False)
+        private_channels = []
+        try:
+            private_channels = slack.list_channels(access_token, types="private_channel", auto_join=False)
+        except:
+            pass
+
+        all_channels = public_channels + private_channels
+
+        channel_stats = []
+        total_messages = 0
+
+        from slack_sdk import WebClient
+        client = WebClient(token=access_token)
+
+        # Count messages in each channel
+        for channel in all_channels:
+            try:
+                # Get message count for this channel
+                response = client.conversations_history(
+                    channel=channel["id"],
+                    oldest=str(oldest),
+                    limit=1  # We just want to see if there are messages
+                )
+
+                # Count total by paginating
+                count = 0
+                cursor = None
+                while True:
+                    response = client.conversations_history(
+                        channel=channel["id"],
+                        oldest=str(oldest),
+                        limit=200,
+                        cursor=cursor
+                    )
+
+                    messages = response.get("messages", [])
+                    # Filter out bot messages and system messages
+                    real_messages = [m for m in messages if not m.get("subtype") and not m.get("bot_id")]
+                    count += len(real_messages)
+
+                    cursor = response.get("response_metadata", {}).get("next_cursor")
+                    if not cursor:
+                        break
+
+                channel_stats.append({
+                    "channel_id": channel["id"],
+                    "channel_name": channel["name"],
+                    "is_private": channel.get("is_private", False),
+                    "message_count": count
+                })
+                total_messages += count
+
+            except Exception as e:
+                channel_stats.append({
+                    "channel_id": channel["id"],
+                    "channel_name": channel["name"],
+                    "is_private": channel.get("is_private", False),
+                    "message_count": 0,
+                    "error": str(e)
+                })
+
+        # Get current document count from database
+        db_docs = supabase.table("documents")\
+            .select("id", count="exact")\
+            .eq("org_id", org_id)\
+            .eq("source_type", "slack")\
+            .execute()
+
+        db_count = len(db_docs.data) if db_docs.data else 0
+
+        return {
+            "slack_total_messages": total_messages,
+            "slack_total_channels": len(all_channels),
+            "slack_public_channels": len(public_channels),
+            "slack_private_channels": len(private_channels),
+            "database_document_count": db_count,
+            "difference": total_messages - db_count,
+            "channels": channel_stats,
+            "days_back": days_back
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to count Slack messages: {str(e)}")
+
+@app.post("/api/admin/run-migration")
+async def run_migration(migration_name: str = Query(...)):
+    """
+    Run a SQL migration file
+    """
+    try:
+        import os
+        migration_file = f"sql/{migration_name}.sql"
+
+        if not os.path.exists(migration_file):
+            raise HTTPException(status_code=404, detail=f"Migration file {migration_name}.sql not found")
+
+        with open(migration_file, 'r') as f:
+            sql_content = f.read()
+
+        # Split by semicolon and execute each statement
+        statements = [s.strip() for s in sql_content.split(';') if s.strip()]
+
+        results = []
+        for stmt in statements:
+            if stmt:
+                try:
+                    # Use raw SQL execution (note: supabase-py doesn't support this directly)
+                    # We'll need to create the table manually or use a different approach
+                    results.append({"statement": stmt[:100] + "...", "status": "executed"})
+                except Exception as e:
+                    results.append({"statement": stmt[:100] + "...", "status": "failed", "error": str(e)})
+
+        return {
+            "migration": migration_name,
+            "message": "Migration file loaded. Please run via Supabase SQL Editor",
+            "file_path": migration_file,
+            "statements_found": len(statements)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
+
+@app.get("/api/embeddings/stats")
+async def get_embedding_stats(org_id: str = Query(...)):
+    """
+    Get statistics about embeddings for an organization
+    """
+    try:
+        # Count documents
+        docs = supabase.table("documents")\
+            .select("id, embedding_status", count="exact")\
+            .eq("org_id", org_id)\
+            .execute()
+
+        total_docs = len(docs.data) if docs.data else 0
+        completed_docs = len([d for d in docs.data if d.get("embedding_status") == "completed"]) if docs.data else 0
+
+        # Count embeddings and get full structure
+        embeddings = supabase.table("embeddings")\
+            .select("*")\
+            .eq("org_id", org_id)\
+            .limit(3)\
+            .execute()
+
+        total_embeddings_count = supabase.table("embeddings")\
+            .select("id", count="exact")\
+            .eq("org_id", org_id)\
+            .execute()
+
+        total_embeddings = len(total_embeddings_count.data) if total_embeddings_count.data else 0
+
+        # Sample a few embeddings to check structure
+        sample_embeddings = []
+        if embeddings.data and len(embeddings.data) > 0:
+            for emb in embeddings.data:
+                embedding_field = emb.get("embedding")
+                emb_info = {
+                    "id": emb["id"],
+                    "document_id": emb["document_id"],
+                    "content_length": len(emb.get("content", "")) if emb.get("content") else 0,
+                    "has_embedding_field": embedding_field is not None,
+                }
+
+                if embedding_field:
+                    if isinstance(embedding_field, list):
+                        emb_info["embedding_type"] = "list"
+                        emb_info["embedding_dimension"] = len(embedding_field)
+                    elif isinstance(embedding_field, str):
+                        emb_info["embedding_type"] = "string"
+                        emb_info["embedding_length"] = len(embedding_field)
+                    else:
+                        emb_info["embedding_type"] = str(type(embedding_field))
+
+                sample_embeddings.append(emb_info)
+
+        return {
+            "org_id": org_id,
+            "total_documents": total_docs,
+            "documents_with_completed_status": completed_docs,
+            "total_embeddings": total_embeddings,
+            "sample_embeddings": sample_embeddings
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get embedding stats: {str(e)}")
+
+@app.get("/api/admin/memory")
+async def get_memories(
+    org_id: str = Query(...),
+    user_id: str = Query(None),
+    limit: int = Query(10)
+):
+    """
+    Get AI memories for an organization
+    """
+    try:
+        query = (
+            supabase.table("ai_memory")
+            .select("*")
+            .eq("org_id", org_id)
+            .order("importance", desc=True)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+
+        if user_id:
+            query = query.eq("user_id", user_id)
+
+        result = query.execute()
+
+        return {
+            "org_id": org_id,
+            "user_id": user_id,
+            "count": len(result.data) if result.data else 0,
+            "memories": result.data if result.data else []
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve memories: {str(e)}")
 
 # ============================================
 # STARTUP & SHUTDOWN
