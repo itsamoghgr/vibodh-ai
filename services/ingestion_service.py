@@ -286,75 +286,57 @@ class IngestionService:
         query: str,
         org_id: str,
         limit: int = 5,
-        threshold: float = 0.7
+        threshold: float = 0.4
     ) -> List[Dict[str, Any]]:
         """
-        Search for similar documents using embeddings
+        Search for similar documents using pgvector cosine similarity
 
         Args:
             query: Search query
             org_id: Organization ID
-            limit: Max results
-            threshold: Similarity threshold
+            limit: Max results (default 5)
+            threshold: Similarity threshold 0-1 (default 0.4, lower = more permissive)
 
         Returns:
             List of matching documents with similarity scores
         """
-        import numpy as np
-
         # Generate embedding for the query
         query_embedding = self.embedding_service.generate_embedding(query)
-        query_vector = np.array(query_embedding)
 
-        # Fetch all embeddings for this organization
-        result = self.supabase.table("embeddings")\
-            .select("id, document_id, content, embedding, metadata")\
-            .eq("org_id", org_id)\
-            .execute()
+        try:
+            # Use pgvector function for fast similarity search
+            result = self.supabase.rpc(
+                "match_embeddings",
+                {
+                    "query_embedding": query_embedding,
+                    "filter_org_id": org_id,
+                    "match_threshold": threshold,
+                    "match_count": limit
+                }
+            ).execute()
 
-        print(f"[INGEST] DEBUG: Found {len(result.data) if result.data else 0} embeddings for org {org_id}")
+            if not result.data:
+                print(f"[INGEST] No embeddings found for org {org_id}")
+                return []
 
-        if not result.data:
-            print("[INGEST] DEBUG: No embeddings found, returning empty list")
-            return []
+            print(f"[INGEST] Found {len(result.data)} embeddings above threshold {threshold}")
 
-        # Calculate cosine similarity in Python
-        similarities = []
-        max_similarity = 0
-        for item in result.data:
-            # Convert embedding from database format to numpy array
-            # Database may return it as string or list, handle both
-            embedding = item["embedding"]
-            if isinstance(embedding, str):
-                import json
-                embedding = json.loads(embedding)
-            doc_vector = np.array(embedding, dtype=np.float32)
-
-            # Calculate cosine similarity with zero-division protection
-            # similarity = (A · B) / (||A|| * ||B||)
-            dot_product = np.dot(query_vector, doc_vector)
-            norm_query = np.linalg.norm(query_vector)
-            norm_doc = np.linalg.norm(doc_vector)
-            similarity = dot_product / max(norm_query * norm_doc, 1e-8)
-
-            max_similarity = max(max_similarity, similarity)
-
-            # Only include if above threshold
-            if similarity > threshold:
+            # Format results
+            similarities = []
+            for item in result.data:
                 similarities.append({
                     "document_id": item["document_id"],
                     "content": item["content"],
-                    "similarity": float(similarity),
+                    "similarity": float(item["similarity"]),
                     "metadata": item.get("metadata", {})
                 })
 
-        print(f"[INGEST] DEBUG: Max similarity found: {max_similarity:.4f}, threshold: {threshold}")
-        print(f"[INGEST] DEBUG: Found {len(similarities)} documents above threshold")
+            return similarities
 
-        # Sort by similarity (highest first) and limit results
-        similarities.sort(key=lambda x: x["similarity"], reverse=True)
-        print(f"[INGEST] DEBUG: Returning top {min(len(similarities), limit)} results")
-        return similarities[:limit]
+        except Exception as e:
+            print(f"[INGEST] Error in pgvector search: {e}")
+            # Fallback to empty results rather than crash
+            return []
 
 
 def get_ingestion_service(supabase_client: Client) -> IngestionService:

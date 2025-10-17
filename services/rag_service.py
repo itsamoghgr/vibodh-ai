@@ -108,121 +108,82 @@ class RAGService:
         self, query: str, org_id: str, limit: int = 5, threshold: float = 0.4
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve relevant context for a query using semantic search
+        Retrieve relevant context for a query using pgvector semantic search
 
         Args:
             query: User's question
             org_id: Organization ID
             limit: Max number of context items
-            threshold: Similarity threshold (default 0.4-0.5 for optimal recall)
+            threshold: Similarity threshold (default 0.4 for optimal recall)
 
         Returns:
             List of context items with document info
         """
-        import numpy as np
-
         # Generate embedding for the query
         query_embedding = self.embedding_service.generate_embedding(query)
-        query_vector = np.array(query_embedding)
 
-        # Try to get from cache first
-        cached_embeddings = _embeddings_cache.get(org_id)
-
-        if cached_embeddings is not None:
-            embeddings_data = cached_embeddings
-        else:
-            # Fetch all embeddings for this organization
-            result = (
-                self.supabase.table("embeddings")
-                .select("id, document_id, content, embedding, metadata")
-                .eq("org_id", org_id)
-                .execute()
-            )
-
-            if DEBUG:
-                print(
-                    f"[EMBEDDINGS] Fetched {len(result.data) if result.data else 0} embeddings from DB"
-                )
+        try:
+            # Use pgvector function for fast similarity search
+            result = self.supabase.rpc(
+                "match_embeddings",
+                {
+                    "query_embedding": query_embedding,
+                    "filter_org_id": org_id,
+                    "match_threshold": threshold,
+                    "match_count": limit
+                }
+            ).execute()
 
             if not result.data:
                 if DEBUG:
-                    print("[EMBEDDINGS] No embeddings found, returning empty list")
+                    print(f"[RAG] No embeddings found for org {org_id}")
                 return []
 
-            embeddings_data = result.data
-            # Cache for future use
-            _embeddings_cache.set(org_id, embeddings_data)
+            if DEBUG:
+                print(f"[RAG] Found {len(result.data)} embeddings above threshold {threshold}")
+                if result.data:
+                    print(f"[SIMILARITY] Top score: {result.data[0]['similarity']:.4f}")
 
-        # Calculate cosine similarity in Python
-        similarities = []
-        for item in embeddings_data:
-            # Convert embedding from database format to numpy array
-            # Database may return it as string or list, handle both
-            embedding = item["embedding"]
-            if isinstance(embedding, str):
-                import json
+            # Format results
+            similarities = []
+            for item in result.data:
+                similarities.append({
+                    "document_id": item["document_id"],
+                    "content": item["content"],
+                    "similarity": float(item["similarity"]),
+                    "metadata": item.get("metadata", {})
+                })
 
-                embedding = json.loads(embedding)
-            doc_vector = np.array(embedding, dtype=np.float32)
-
-            # Calculate cosine similarity with zero-division protection
-            dot_product = np.dot(query_vector, doc_vector)
-            norm_query = np.linalg.norm(query_vector)
-            norm_doc = np.linalg.norm(doc_vector)
-            similarity = dot_product / max(norm_query * norm_doc, 1e-8)
-
-            # Only include if above threshold
-            if similarity > threshold:
-                similarities.append(
-                    {
-                        "document_id": item["document_id"],
-                        "content": item["content"],
-                        "similarity": float(similarity),
-                        "metadata": item.get("metadata", {}),
-                    }
+            # Enrich with document metadata (author, channel, etc.)
+            enriched_results = []
+            for sim_result in similarities:
+                doc = (
+                    self.supabase.table("documents")
+                    .select(
+                        "author, author_id, channel_name, channel_id, title, url, created_at"
+                    )
+                    .eq("id", sim_result["document_id"])
+                    .single()
+                    .execute()
                 )
 
-        if DEBUG:
-            print(
-                f"[SIMILARITY] Found {len(similarities)} documents above threshold {threshold}"
-            )
-            if similarities:
-                print(
-                    f"[SIMILARITY] Top score: {max(s['similarity'] for s in similarities):.4f}"
-                )
+                if doc.data:
+                    sim_result["author"] = doc.data.get("author")
+                    sim_result["author_id"] = doc.data.get("author_id")
+                    sim_result["channel_name"] = doc.data.get("channel_name")
+                    sim_result["channel_id"] = doc.data.get("channel_id")
+                    sim_result["title"] = doc.data.get("title")
+                    sim_result["url"] = doc.data.get("url")
+                    sim_result["created_at"] = doc.data.get("created_at")
 
-        # Sort by similarity (highest first) and limit results
-        similarities.sort(key=lambda x: x["similarity"], reverse=True)
-        top_results = similarities[:limit]
+                enriched_results.append(sim_result)
 
-        if DEBUG:
-            print(f"[CONTEXT] Returning top {len(top_results)} results")
+            return enriched_results
 
-        # Enrich with document metadata (author, channel, etc.)
-        enriched_results = []
-        for result in top_results:
-            doc = (
-                self.supabase.table("documents")
-                .select(
-                    "author, author_id, channel_name, channel_id, title, url, created_at"
-                )
-                .eq("id", result["document_id"])
-                .single()
-                .execute()
-            )
-
-            if doc.data:
-                result["author"] = doc.data.get("author")
-                result["author_id"] = doc.data.get("author_id")
-                result["channel_name"] = doc.data.get("channel_name")
-                result["channel_id"] = doc.data.get("channel_id")
-                result["title"] = doc.data.get("title")
-                result["url"] = doc.data.get("url")
-                result["created_at"] = doc.data.get("created_at")
-
-            enriched_results.append(result)
-
-        return enriched_results
+        except Exception as e:
+            if DEBUG:
+                print(f"[RAG] Error in pgvector search: {e}")
+            return []
 
     async def store_memory(
         self,
