@@ -11,6 +11,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import os
 from datetime import datetime
+from typing import Optional
 import hmac
 import hashlib
 import time
@@ -1312,6 +1313,76 @@ async def get_edges(
         raise HTTPException(status_code=500, detail=f"Failed to get edges: {str(e)}")
 
 # ============================================
+# AI INSIGHTS ENDPOINTS
+# ============================================
+
+@app.post("/api/insights/run/{org_id}")
+async def generate_insights(
+    org_id: str,
+    days: int = Query(default=7, ge=1, le=30, description="Number of days to analyze")
+):
+    """
+    Generate AI insights for an organization
+
+    Analyzes recent KG activity, memory summaries, and documents to generate
+    actionable insights about projects, teams, trends, and risks.
+    """
+    try:
+        from services.insight_service import get_insight_service
+        insight_service = get_insight_service(supabase)
+
+        result = insight_service.generate_insights(org_id, days)
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate insights: {str(e)}")
+
+@app.get("/api/insights/list/{org_id}")
+async def list_insights(
+    org_id: str,
+    limit: int = Query(default=10, ge=1, le=100, description="Maximum number of insights to return"),
+    category: Optional[str] = Query(default=None, description="Filter by category: project, team, trend, risk, general")
+):
+    """
+    List recent AI insights for an organization
+
+    Returns insights sorted by creation date (most recent first).
+    Optionally filter by category.
+    """
+    try:
+        from services.insight_service import get_insight_service
+        insight_service = get_insight_service(supabase)
+
+        insights = insight_service.list_insights(org_id, limit, category)
+
+        return {
+            "insights": insights,
+            "count": len(insights)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list insights: {str(e)}")
+
+@app.get("/api/insights/stats/{org_id}")
+async def get_insight_stats(org_id: str):
+    """
+    Get insight statistics for an organization
+
+    Returns counts by category, average confidence, and last generation time.
+    """
+    try:
+        from services.insight_service import get_insight_service
+        insight_service = get_insight_service(supabase)
+
+        stats = insight_service.get_insight_stats(org_id)
+
+        return stats
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get insight stats: {str(e)}")
+
+# ============================================
 # STARTUP / SHUTDOWN EVENTS
 # ============================================
 
@@ -1319,7 +1390,7 @@ async def get_edges(
 async def startup_event():
     """Run on application startup"""
     print("=" * 50)
-    print("Vibodh AI API - Phase 2, Step 2")
+    print("Vibodh AI API - Phase 2, Step 3")
     print("=" * 50)
     print(f"Supabase: {SUPABASE_URL}")
     print(f"OpenAI: {'Configured' if os.getenv('OPENAI_API_KEY') else 'NOT configured'}")
@@ -1329,6 +1400,7 @@ async def startup_event():
     print("Ready to receive requests!")
     print("API Docs: http://localhost:8000/docs")
     print("Knowledge Graph: ENABLED")
+    print("AI Insights: ENABLED")
     print("=" * 50)
 
 @app.on_event("shutdown")

@@ -158,11 +158,71 @@ class RAGService:
                 print(f"[GRAPH ERROR] {str(e)}")
             return []
 
+    def _retrieve_recent_insights(self, query: str, org_id: str, limit: int = 3) -> List[Dict[str, Any]]:
+        """
+        Retrieve recent AI insights if query suggests user wants updates/summaries
+
+        Args:
+            query: User's question
+            org_id: Organization ID
+            limit: Max number of insights to retrieve
+
+        Returns:
+            List of insights formatted as context items
+        """
+        # Check if query is asking for updates, summaries, or insights
+        query_lower = query.lower()
+        insight_keywords = [
+            "what's new", "whats new", "any updates", "summary", "overview",
+            "what happened", "recent activity", "latest", "any issues",
+            "what's going on", "whats going on", "status", "catch me up"
+        ]
+
+        is_insight_query = any(keyword in query_lower for keyword in insight_keywords)
+
+        if not is_insight_query:
+            return []
+
+        try:
+            # Fetch recent insights
+            result = self.supabase.table("ai_insights")\
+                .select("id, category, title, summary, recommendations, confidence, created_at")\
+                .eq("org_id", org_id)\
+                .order("created_at", desc=True)\
+                .limit(limit)\
+                .execute()
+
+            if not result.data:
+                return []
+
+            # Format insights as context items
+            insight_items = []
+            for insight in result.data:
+                insight_items.append({
+                    "type": "insight",
+                    "category": insight.get("category"),
+                    "title": insight.get("title"),
+                    "summary": insight.get("summary"),
+                    "recommendations": insight.get("recommendations"),
+                    "confidence": insight.get("confidence"),
+                    "created_at": insight.get("created_at")
+                })
+
+            if DEBUG and insight_items:
+                print(f"[INSIGHTS] Retrieved {len(insight_items)} recent insights for query")
+
+            return insight_items
+
+        except Exception as e:
+            if DEBUG:
+                print(f"[INSIGHTS ERROR] {str(e)}")
+            return []
+
     def retrieve_context(
         self, query: str, org_id: str, limit: int = 5, threshold: float = 0.3, use_hybrid: bool = True
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve relevant context using hybrid retrieval (vector + graph)
+        Retrieve relevant context using hybrid retrieval (vector + graph + insights)
 
         Args:
             query: User's question
@@ -172,7 +232,7 @@ class RAGService:
             use_hybrid: Whether to include graph context (default True)
 
         Returns:
-            List of context items with document info and graph relationships
+            List of context items with document info, graph relationships, and insights
         """
         import numpy as np
 
@@ -278,7 +338,12 @@ class RAGService:
 
             enriched_results.append(result)
 
-        # Step 2: Add graph context if hybrid mode is enabled
+        # Step 2: Add insights if query suggests user wants updates/summaries
+        insight_results = self._retrieve_recent_insights(query, org_id, limit=3)
+        for insight_item in insight_results:
+            enriched_results.append(insight_item)
+
+        # Step 3: Add graph context if hybrid mode is enabled
         if use_hybrid:
             graph_results = self.retrieve_graph_context(query, org_id, limit=3)
 
@@ -287,7 +352,7 @@ class RAGService:
                 enriched_results.append(graph_item)
 
             if DEBUG and graph_results:
-                print(f"[HYBRID] Combined {len(top_results)} vector results + {len(graph_results)} graph results")
+                print(f"[HYBRID] Combined {len(top_results)} vector results + {len(insight_results)} insights + {len(graph_results)} graph results")
 
         return enriched_results
 
