@@ -1742,6 +1742,80 @@ async def clickup_webhook(request: Request):
         raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
 
 # ============================================
+# ORCHESTRATOR / COGNITIVE CORE
+# Phase 3, Step 1
+# ============================================
+
+@app.post("/api/orchestrate/query")
+async def orchestrate_query(
+    request: Request,
+    query: str = Query(..., description="User query to process"),
+    org_id: str = Query(..., description="Organization ID")
+):
+    """
+    Orchestrate a query through the cognitive core.
+
+    Workflow:
+    1. Classify intent (question, task, summary, insight, risk)
+    2. Route to appropriate modules (RAG, KG, Insights)
+    3. Execute module queries in parallel
+    4. Build reasoning chain
+    5. Generate final response
+    6. Log reasoning steps
+    """
+    try:
+        from services.orchestrator_service import get_orchestrator_service
+
+        # Get user ID from request (if authenticated)
+        user_id = None
+        try:
+            auth_header = request.headers.get("Authorization")
+            if auth_header:
+                # Extract user from Supabase auth
+                token = auth_header.replace("Bearer ", "")
+                user_response = supabase.auth.get_user(token)
+                if user_response and user_response.user:
+                    user_id = str(user_response.user.id)
+        except:
+            pass  # Continue without user_id
+
+        orchestrator = get_orchestrator_service(supabase)
+        result = await orchestrator.orchestrate_query(query, org_id, user_id)
+
+        return result
+
+    except Exception as e:
+        import traceback
+        print(f"[ORCHESTRATOR] Error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Orchestration failed: {str(e)}")
+
+
+@app.get("/api/orchestrate/logs")
+async def get_reasoning_logs(
+    org_id: str = Query(..., description="Organization ID"),
+    limit: int = Query(10, description="Number of logs to retrieve")
+):
+    """
+    Get recent reasoning logs for an organization.
+    """
+    try:
+        logs = supabase.table("reasoning_logs")\
+            .select("*")\
+            .eq("org_id", org_id)\
+            .order("created_at", desc=True)\
+            .limit(limit)\
+            .execute()
+
+        return {
+            "logs": logs.data if logs.data else [],
+            "count": len(logs.data) if logs.data else 0
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve logs: {str(e)}")
+
+
+# ============================================
 # STARTUP / SHUTDOWN EVENTS
 # ============================================
 
@@ -1749,7 +1823,7 @@ async def clickup_webhook(request: Request):
 async def startup_event():
     """Run on application startup"""
     print("=" * 50)
-    print("Vibodh AI API - Phase 2, Step 3")
+    print("Vibodh AI API - Phase 3, Step 1")
     print("=" * 50)
     print(f"Supabase: {SUPABASE_URL}")
     print(f"OpenAI: {'Configured' if os.getenv('OPENAI_API_KEY') else 'NOT configured'}")
@@ -1761,6 +1835,7 @@ async def startup_event():
     print("Knowledge Graph: ENABLED")
     print("AI Insights: ENABLED")
     print("ClickUp Integration: ENABLED")
+    print("Cognitive Core (Orchestrator): ENABLED")
     print("=" * 50)
 
 @app.on_event("shutdown")
