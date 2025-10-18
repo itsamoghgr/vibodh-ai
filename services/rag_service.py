@@ -105,7 +105,7 @@ class RAGService:
             return []
 
     def retrieve_context(
-        self, query: str, org_id: str, limit: int = 5, threshold: float = 0.4
+        self, query: str, org_id: str, limit: int = 5, threshold: float = 0.3
     ) -> List[Dict[str, Any]]:
         """
         Retrieve relevant context for a query using semantic search
@@ -114,7 +114,7 @@ class RAGService:
             query: User's question
             org_id: Organization ID
             limit: Max number of context items
-            threshold: Similarity threshold (default 0.4-0.5 for optimal recall)
+            threshold: Similarity threshold (default 0.3 for better recall)
 
         Returns:
             List of context items with document info
@@ -278,9 +278,10 @@ class RAGService:
         max_context_items: int = 5,
         system_prompt: Optional[str] = None,
         user_id: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
     ) -> AsyncGenerator[str, None]:
         """
-        Generate a streaming answer using RAG with memory layer
+        Generate a streaming answer using RAG with memory layer and conversation history
 
         Args:
             query: User's question
@@ -288,6 +289,7 @@ class RAGService:
             max_context_items: Max context items to retrieve
             system_prompt: Optional custom system prompt
             user_id: Optional user ID for personalized memories
+            conversation_history: Optional list of previous messages [{"role": "user", "content": "..."}, ...]
 
         Yields:
             Answer chunks as they're generated
@@ -306,7 +308,7 @@ class RAGService:
                 query=query,
                 org_id=org_id,
                 limit=max_context_items,
-                threshold=0.4,  # Optimal threshold for recall
+                threshold=0.3,  # Lower threshold for better recall
             )
 
         # For simple queries, just respond naturally without needing context
@@ -374,10 +376,18 @@ Guidelines for interaction:
 
 Remember: You're not searching files - you're a smart team member. Act natural and keep responses concise unless asked for details."""
 
-        # Build messages
+        # Build messages with conversation history
         messages = [
             {"role": "system", "content": system_prompt},
         ]
+
+        # Add conversation history if available (exclude the current query if it's in history)
+        if conversation_history:
+            for msg in conversation_history:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
 
         # For simple queries, don't include context in the prompt
         if is_simple_query:

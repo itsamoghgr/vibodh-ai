@@ -4,13 +4,16 @@ Vibodh AI - FastAPI Backend
 Phase 1 - Step 2: Data Ingestion + Embeddings + RAG
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import os
 from datetime import datetime
+import hmac
+import hashlib
+import time
 
 # Import models
 from models.schemas import (
@@ -258,8 +261,167 @@ async def get_ingestion_stats(org_id: str = Query(...)):
         return {"channels": list(channel_stats.values())}
 
 # ============================================
+# FIX USER MENTIONS ROUTE
+# ============================================
+
+@app.post("/api/fix-user-mentions/{org_id}")
+async def fix_user_mentions(org_id: str):
+    """
+    Fix user mentions in all documents by replacing IDs with actual names.
+    Uses the author information we already have stored.
+    """
+    try:
+        import re
+
+        # Get all unique users with their IDs and names
+        user_result = supabase.table("documents")\
+            .select("author_id, author")\
+            .eq("org_id", org_id)\
+            .not_.is_("author_id", "null")\
+            .not_.is_("author", "null")\
+            .execute()
+
+        # Build user ID to name mapping
+        user_mapping = {}
+        for doc in user_result.data:
+            if doc.get("author_id") and doc.get("author") and doc["author"] != "Unknown":
+                user_mapping[doc["author_id"]] = doc["author"]
+
+        print(f"[FIX MENTIONS] Found {len(user_mapping)} unique users to map")
+
+        # Get all documents with user mentions
+        docs_result = supabase.table("documents")\
+            .select("id, content")\
+            .eq("org_id", org_id)\
+            .execute()
+
+        docs_updated = 0
+        embeddings_updated = 0
+
+        # Update each document
+        for doc in docs_result.data:
+            original_content = doc["content"]
+            updated_content = original_content
+
+            # Replace each user ID with their name
+            for user_id, user_name in user_mapping.items():
+                # Replace <@U123> format
+                updated_content = updated_content.replace(f"<@{user_id}>", f"@{user_name}")
+                # Replace @U123 format
+                updated_content = re.sub(rf'@{user_id}(?![A-Z0-9])', f"@{user_name}", updated_content)
+
+            # Only update if content changed
+            if updated_content != original_content:
+                supabase.table("documents").update({
+                    "content": updated_content
+                }).eq("id", doc["id"]).execute()
+                docs_updated += 1
+
+                # Also update corresponding embeddings
+                embeddings_result = supabase.table("embeddings")\
+                    .select("id, content")\
+                    .eq("document_id", doc["id"])\
+                    .execute()
+
+                for emb in embeddings_result.data:
+                    emb_content = emb["content"]
+                    for user_id, user_name in user_mapping.items():
+                        emb_content = emb_content.replace(f"<@{user_id}>", f"@{user_name}")
+                        emb_content = re.sub(rf'@{user_id}(?![A-Z0-9])', f"@{user_name}", emb_content)
+
+                    if emb_content != emb["content"]:
+                        supabase.table("embeddings").update({
+                            "content": emb_content
+                        }).eq("id", emb["id"]).execute()
+                        embeddings_updated += 1
+
+        print(f"[FIX MENTIONS] Updated {docs_updated} documents and {embeddings_updated} embeddings")
+
+        return {
+            "success": True,
+            "users_mapped": len(user_mapping),
+            "documents_updated": docs_updated,
+            "embeddings_updated": embeddings_updated
+        }
+
+    except Exception as e:
+        print(f"[FIX MENTIONS] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
 # EMBEDDINGS & SEARCH ROUTES
 # ============================================
+
+@app.post("/api/retry-failed-embeddings/{org_id}")
+async def retry_failed_embeddings(org_id: str):
+    """
+    Retry embedding generation for all documents with 'failed' status
+    First check if embeddings exist, if so just mark as completed
+    """
+    try:
+        ingestion_service = get_ingestion_service(supabase)
+
+        # Get all failed documents
+        failed_result = supabase.table("documents")\
+            .select("id, content")\
+            .eq("org_id", org_id)\
+            .eq("embedding_status", "failed")\
+            .execute()
+
+        if not failed_result.data:
+            return {
+                "success": True,
+                "message": "No failed embeddings to retry",
+                "retried": 0
+            }
+
+        success_count = 0
+        already_embedded_count = 0
+        failed_count = 0
+
+        for doc in failed_result.data:
+            try:
+                # Check if embeddings already exist for this document
+                existing_emb = supabase.table("embeddings")\
+                    .select("id")\
+                    .eq("org_id", org_id)\
+                    .eq("document_id", doc["id"])\
+                    .limit(1)\
+                    .execute()
+
+                if existing_emb.data and len(existing_emb.data) > 0:
+                    # Embeddings exist, just update status
+                    supabase.table("documents")\
+                        .update({"embedding_status": "completed"})\
+                        .eq("id", doc["id"])\
+                        .execute()
+                    already_embedded_count += 1
+                    print(f"[RETRY] Document {doc['id']} already has embeddings, marked as completed")
+                else:
+                    # No embeddings, generate them
+                    await ingestion_service._generate_embeddings(
+                        document_id=doc["id"],
+                        content=doc["content"],
+                        org_id=org_id
+                    )
+                    success_count += 1
+                    print(f"[RETRY] Successfully embedded document {doc['id']}")
+
+            except Exception as e:
+                print(f"[RETRY] Failed to embed document {doc['id']}: {str(e)}")
+                failed_count += 1
+
+        return {
+            "success": True,
+            "message": f"Processed {len(failed_result.data)} failed documents",
+            "newly_embedded": success_count,
+            "already_had_embeddings": already_embedded_count,
+            "failed": failed_count,
+            "total_processed": len(failed_result.data)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Retry failed: {str(e)}")
 
 @app.post("/api/embeddings/search", response_model=EmbeddingSearchResponse)
 async def search_embeddings(request: EmbeddingSearchRequest):
@@ -367,6 +529,18 @@ async def chat_stream(request: ChatStreamRequest):
             session = supabase.table("chat_sessions").insert(session_data).execute()
             session_id = session.data[0]["id"]
 
+        # Get conversation history (last 10 messages)
+        conversation_history = []
+        if session_id:
+            history_result = supabase.table("chat_messages")\
+                .select("role, content")\
+                .eq("session_id", session_id)\
+                .order("created_at", desc=False)\
+                .limit(10)\
+                .execute()
+            if history_result.data:
+                conversation_history = history_result.data
+
         # Store user message (only if session exists)
         if session_id:
             user_message = {
@@ -384,10 +558,21 @@ async def chat_stream(request: ChatStreamRequest):
         context_items = []
         if not is_simple_query:
             rag_service_instance = get_rag_service(supabase)
+
+            # If we have conversation history, use it to improve the search query
+            search_query = request.query
+            if conversation_history and len(conversation_history) > 0:
+                # Get last few messages for context
+                recent_context = conversation_history[-3:] if len(conversation_history) >= 3 else conversation_history
+                context_summary = " ".join([msg["content"] for msg in recent_context])
+                # Combine with current query for better embedding
+                search_query = f"{context_summary} {request.query}"
+
             context_items = rag_service_instance.retrieve_context(
-                query=request.query,
+                query=search_query,
                 org_id=request.org_id,
-                limit=request.max_context_items
+                limit=request.max_context_items,
+                threshold=0.3  # Lower threshold for better recall
             )
 
         # Generate streaming response
@@ -402,12 +587,13 @@ async def chat_stream(request: ChatStreamRequest):
             if context_items:
                 yield f"data: {json.dumps({'type': 'context', 'context': context_items})}\n\n"
 
-            # Stream answer (with user_id for memory personalization)
+            # Stream answer (with user_id for memory personalization and conversation history)
             async for chunk in rag_service.generate_answer_stream(
                 query=request.query,
                 org_id=request.org_id,
                 max_context_items=request.max_context_items,
-                user_id=request.user_id
+                user_id=request.user_id,
+                conversation_history=conversation_history
             ):
                 full_response += chunk
                 yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
@@ -418,8 +604,10 @@ async def chat_stream(request: ChatStreamRequest):
                     "session_id": session_id,
                     "role": "assistant",
                     "content": full_response,
-                    "context": context_items if context_items else []
                 }
+                # Only include context if there are items
+                if context_items and len(context_items) > 0:
+                    assistant_message["context"] = context_items
                 supabase.table("chat_messages").insert(assistant_message).execute()
 
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -839,6 +1027,124 @@ async def get_memories(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve memories: {str(e)}")
+
+# ============================================
+# SLACK EVENTS WEBHOOK (PHASE 2)
+# ============================================
+
+def verify_slack_signature(
+    signing_secret: str,
+    timestamp: str,
+    body: bytes,
+    signature: str
+) -> bool:
+    """
+    Verify Slack request signature for security
+    https://api.slack.com/authentication/verifying-requests-from-slack
+    """
+    # Prevent replay attacks (request must be within 5 minutes)
+    if abs(time.time() - int(timestamp)) > 60 * 5:
+        print("[SLACK SECURITY] Request timestamp too old")
+        return False
+
+    # Compute the signature
+    sig_basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
+    computed_signature = 'v0=' + hmac.new(
+        signing_secret.encode(),
+        sig_basestring.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    # Compare signatures using constant-time comparison
+    return hmac.compare_digest(computed_signature, signature)
+
+
+@app.post("/api/slack/events")
+async def slack_events(
+    request: Request,
+    x_slack_signature: str = Header(None),
+    x_slack_request_timestamp: str = Header(None)
+):
+    """
+    Handle Slack Events API webhook for real-time message sync
+    Phase 2 - Step 1: Real-time sync with signature verification
+    """
+    try:
+        # Read raw body for signature verification
+        body = await request.body()
+        body_json = await request.json()
+
+        # Verify Slack signature if signing secret is configured
+        slack_signing_secret = os.getenv("SLACK_SIGNING_SECRET")
+        if slack_signing_secret and x_slack_signature and x_slack_request_timestamp:
+            if not verify_slack_signature(
+                slack_signing_secret,
+                x_slack_request_timestamp,
+                body,
+                x_slack_signature
+            ):
+                print("[SLACK SECURITY] Invalid signature")
+                raise HTTPException(status_code=401, detail="Invalid signature")
+        elif slack_signing_secret:
+            print("[SLACK SECURITY WARNING] Signing secret configured but headers missing")
+
+        # Handle Slack URL verification challenge
+        if body_json.get("type") == "url_verification":
+            print("[SLACK EVENTS] Handling URL verification challenge")
+            return {"challenge": body_json.get("challenge")}
+
+        # Handle event callbacks
+        if body_json.get("type") == "event_callback":
+            event = body_json.get("event", {})
+            event_type = event.get("type")
+
+            print(f"[SLACK EVENTS] Received event: {event_type}")
+
+            # Handle new message events
+            if event_type == "message" and not event.get("subtype"):
+                # Get team_id to find the connection
+                team_id = body_json.get("team_id")
+
+                # Find the connection for this workspace
+                connection_result = supabase.table("connections")\
+                    .select("id, org_id, access_token")\
+                    .eq("workspace_id", team_id)\
+                    .eq("source_type", "slack")\
+                    .eq("status", "active")\
+                    .single()\
+                    .execute()
+
+                if not connection_result.data:
+                    print(f"[SLACK EVENTS] No active connection found for team {team_id}")
+                    return {"ok": True}
+
+                connection = connection_result.data
+
+                # Process the event asynchronously
+                ingestion = get_ingestion_service(supabase)
+                await ingestion.handle_slack_event(
+                    event=event,
+                    org_id=connection["org_id"],
+                    connection_id=connection["id"],
+                    access_token=connection["access_token"]
+                )
+
+                print(f"[SLACK EVENTS] Successfully processed message event")
+                return {"ok": True}
+
+            else:
+                print(f"[SLACK EVENTS] Ignoring event type: {event_type}")
+                return {"ok": True}
+
+        # Return OK for other event types
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[SLACK EVENTS] Error processing event: {e}")
+        # Always return 200 to Slack to avoid retries
+        return {"ok": True}
 
 # ============================================
 # STARTUP & SHUTDOWN

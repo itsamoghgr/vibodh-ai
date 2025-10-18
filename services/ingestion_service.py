@@ -23,7 +23,7 @@ class IngestionService:
         org_id: str,
         connection_id: str,
         channel_ids: Optional[List[str]] = None,
-        days_back: int = 30
+        days_back: int = 3650  # ~10 years - effectively all history
     ) -> Dict[str, Any]:
         """
         Ingest messages from Slack
@@ -102,7 +102,9 @@ class IngestionService:
             print(f"Found {len(existing_source_ids)} existing documents")
 
             # Ingest each channel
-            for channel_id in channel_ids:
+            for idx, channel_id in enumerate(channel_ids):
+                print(f"[SYNC] Processing channel {idx+1}/{len(channel_ids)}: {channel_id}")
+
                 # Fetch messages
                 try:
                     messages = self.slack.fetch_messages(
@@ -110,6 +112,7 @@ class IngestionService:
                         channel_id=channel_id,
                         days_back=days_back
                     )
+                    print(f"[SYNC] Fetched {len(messages)} messages from channel {channel_id}")
                 except Exception as e:
                     error_message = str(e)
                     # Skip channels we don't have access to
@@ -129,7 +132,9 @@ class IngestionService:
                 )
 
                 # Process each message
-                for msg in messages:
+                for msg_idx, msg in enumerate(messages):
+                    if msg_idx % 10 == 0:  # Log every 10 messages
+                        print(f"[SYNC] Processing message {msg_idx+1}/{len(messages)} in channel {channel_id}")
                     # Create unique source_id for this message
                     source_id = f"slack_{channel_id}_{msg['ts']}"
 
@@ -144,6 +149,49 @@ class IngestionService:
                     # Build full content including thread replies
                     full_content = msg["text"]
 
+                    # Replace user mentions with actual names
+                    import re
+                    def replace_user_mention(match):
+                        mentioned_user_id = match.group(1)
+                        try:
+                            mentioned_user = self.slack.get_user_info(access_token, mentioned_user_id)
+                            return f"@{mentioned_user.get('real_name') or mentioned_user.get('name') or mentioned_user_id}"
+                        except:
+                            return f"<@{mentioned_user_id}>"
+
+                    # Replace <@U123> with @Name
+                    full_content = re.sub(r'<@([A-Z0-9]+)>', replace_user_mention, full_content)
+
+                    # Extract and append file attachments, links, and other content
+                    if msg.get("files"):
+                        full_content += "\n\n--- Attached Files ---\n"
+                        for file in msg["files"]:
+                            file_name = file.get("name", "unknown")
+                            file_type = file.get("mimetype", "unknown")
+                            file_url = file.get("url_private", file.get("permalink", ""))
+                            full_content += f"\n📎 {file_name} ({file_type})\nURL: {file_url}\n"
+
+                            # For text files, try to download content
+                            if file.get("mimetype", "").startswith("text/") or file_name.endswith((".txt", ".md", ".csv")):
+                                try:
+                                    import requests
+                                    headers = {"Authorization": f"Bearer {access_token}"}
+                                    file_response = requests.get(file.get("url_private", ""), headers=headers, timeout=10)
+                                    if file_response.status_code == 200:
+                                        file_content = file_response.text[:5000]  # Limit to 5000 chars
+                                        full_content += f"\nFile Content:\n{file_content}\n"
+                                except Exception as e:
+                                    print(f"Could not download file {file_name}: {e}")
+
+                    # Extract shared links
+                    if msg.get("attachments"):
+                        full_content += "\n\n--- Shared Links ---\n"
+                        for attachment in msg["attachments"]:
+                            if attachment.get("title") and attachment.get("title_link"):
+                                full_content += f"\n🔗 {attachment['title']}: {attachment['title_link']}\n"
+                            if attachment.get("text"):
+                                full_content += f"{attachment['text'][:500]}\n"
+
                     # If message has replies, fetch and append them
                     if msg.get("reply_count", 0) > 0:
                         try:
@@ -153,7 +201,9 @@ class IngestionService:
                                 thread_ts=msg["ts"]
                             )
                             if thread_replies:
-                                full_content += "\n\n--- Thread Replies ---\n" + "\n\n".join(thread_replies)
+                                # Also replace user mentions in thread replies
+                                resolved_replies = [re.sub(r'<@([A-Z0-9]+)>', replace_user_mention, reply) for reply in thread_replies]
+                                full_content += "\n\n--- Thread Replies ---\n" + "\n\n".join(resolved_replies)
                         except Exception as e:
                             print(f"Could not fetch thread replies for message {msg['ts']}: {e}")
 
@@ -355,6 +405,173 @@ class IngestionService:
         similarities.sort(key=lambda x: x["similarity"], reverse=True)
         print(f"[INGEST] DEBUG: Returning top {min(len(similarities), limit)} results")
         return similarities[:limit]
+
+
+    async def handle_slack_event(
+        self,
+        event: Dict[str, Any],
+        org_id: str,
+        connection_id: str,
+        access_token: str
+    ) -> None:
+        """
+        Handle real-time Slack event (Phase 2 - Step 1)
+
+        Args:
+            event: Slack event payload
+            org_id: Organization ID
+            connection_id: Connection ID
+            access_token: Slack access token
+        """
+        try:
+            # Extract event data
+            user_id = event.get("user")
+            channel_id = event.get("channel")
+            ts = event.get("ts")
+
+            # Try to get formatted text from blocks first (has resolved mentions)
+            text = ""
+            blocks = event.get("blocks", [])
+            if blocks:
+                # Extract text from rich text blocks (preserves user mentions as names)
+                for block in blocks:
+                    if block.get("type") == "rich_text":
+                        for element in block.get("elements", []):
+                            if element.get("type") == "rich_text_section":
+                                for item in element.get("elements", []):
+                                    if item.get("type") == "text":
+                                        text += item.get("text", "")
+                                    elif item.get("type") == "user":
+                                        # User mention - get the actual name
+                                        user_id_mentioned = item.get("user_id")
+                                        if user_id_mentioned:
+                                            try:
+                                                user_data = self.slack.get_user_info(access_token, user_id_mentioned)
+                                                name = user_data.get("real_name") or user_data.get("name") or user_id_mentioned
+                                                text += f"@{name}"
+                                            except:
+                                                text += f"<@{user_id_mentioned}>"
+                                    elif item.get("type") == "link":
+                                        text += item.get("url", "")
+
+            # Fallback to plain text if blocks parsing failed
+            if not text:
+                text = event.get("text", "")
+
+            if not all([text, channel_id, ts]):
+                print(f"[REALTIME] Missing required fields in event")
+                return
+
+            # Create unique source_id for deduplication
+            source_id = f"slack_{channel_id}_{ts}"
+
+            # Check if document already exists
+            existing = self.supabase.table("documents")\
+                .select("id")\
+                .eq("source_id", source_id)\
+                .execute()
+
+            if existing.data:
+                print(f"[REALTIME] Document already exists: {source_id}")
+                return
+
+            # Get user info
+            user_info = {}
+            if user_id:
+                try:
+                    user_info = self.slack.get_user_info(access_token, user_id)
+                except Exception as e:
+                    print(f"[REALTIME] Could not fetch user info: {e}")
+
+            # Get channel info
+            channel_name = channel_id
+            try:
+                channels = self.slack.list_channels(access_token)
+                channel_name = next(
+                    (ch["name"] for ch in channels if ch["id"] == channel_id),
+                    channel_id
+                )
+            except Exception as e:
+                print(f"[REALTIME] Could not fetch channel info: {e}")
+
+            author = user_info.get("real_name") or user_info.get("name") or user_id or "Unknown"
+
+            # Replace user mentions with actual names
+            import re
+            def replace_user_mention(match):
+                mentioned_user_id = match.group(1)
+                try:
+                    mentioned_user = self.slack.get_user_info(access_token, mentioned_user_id)
+                    return f"@{mentioned_user.get('real_name') or mentioned_user.get('name') or mentioned_user_id}"
+                except:
+                    return f"<@{mentioned_user_id}>"
+
+            # Replace <@U123> with @Name
+            text = re.sub(r'<@([A-Z0-9]+)>', replace_user_mention, text)
+
+            # Insert document
+            doc_data = {
+                "org_id": org_id,
+                "connection_id": connection_id,
+                "source_type": "slack",
+                "source_id": source_id,
+                "title": f"Message in #{channel_name}",
+                "content": text,
+                "author": author,
+                "author_id": user_id,
+                "channel_name": channel_name,
+                "channel_id": channel_id,
+                "embedding_status": "pending",
+                "metadata": {
+                    "ts": ts,
+                    "event_time": event.get("event_ts"),
+                    "channel_type": event.get("channel_type")
+                }
+            }
+
+            doc = self.supabase.table("documents").insert(doc_data).execute()
+
+            if not doc.data:
+                print(f"[REALTIME] Failed to insert document")
+                return
+
+            document_id = doc.data[0]["id"]
+            print(f"[REALTIME] Created document: {document_id}")
+
+            # Generate and insert embeddings
+            try:
+                await self._generate_embeddings(document_id, text, org_id)
+                print(f"[REALTIME] Generated embeddings for document: {document_id}")
+            except Exception as e:
+                print(f"[REALTIME] Failed to generate embeddings: {e}")
+
+            # Store raw event in events table
+            try:
+                event_data = {
+                    "org_id": org_id,
+                    "source": "slack",
+                    "actor_id": user_id,
+                    "payload": event,
+                    "happened_at": datetime.fromtimestamp(float(ts)).isoformat()
+                }
+                self.supabase.table("events").insert(event_data).execute()
+                print(f"[REALTIME] Stored event in events table")
+            except Exception as e:
+                print(f"[REALTIME] Failed to store event: {e}")
+
+            # Update connection with webhook status
+            now_iso = datetime.now().isoformat()
+            self.supabase.table("connections").update({
+                "last_sync_at": now_iso,
+                "metadata": {
+                    "webhook_active": True,
+                    "last_webhook_event": now_iso
+                }
+            }).eq("id", connection_id).execute()
+
+        except Exception as e:
+            print(f"[REALTIME] Error handling Slack event: {e}")
+            raise
 
 
 def get_ingestion_service(supabase_client: Client) -> IngestionService:
