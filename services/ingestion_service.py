@@ -236,8 +236,15 @@ class IngestionService:
                             existing_source_ids.add(source_id)  # Add to set to prevent duplicates in same run
                             print(f"✓ Created document: {doc_data['title']}")
 
-                            # Generate embeddings
-                            await self._generate_embeddings(doc.data[0]["id"], doc_data["content"], org_id)
+                            # Generate embeddings and build KG
+                            doc_metadata = {
+                                "author": doc_data.get("author"),
+                                "author_id": doc_data.get("author_id"),
+                                "channel_name": doc_data.get("channel_name"),
+                                "channel_id": doc_data.get("channel_id"),
+                                "source_type": doc_data.get("source_type")
+                            }
+                            await self._generate_embeddings(doc.data[0]["id"], doc_data["content"], org_id, doc_metadata)
                             total_embedded += 1
                     except Exception as e:
                         # If it's a duplicate key error, skip silently
@@ -292,14 +299,15 @@ class IngestionService:
 
             raise Exception(f"Ingestion failed: {str(e)}")
 
-    async def _generate_embeddings(self, document_id: str, content: str, org_id: str):
+    async def _generate_embeddings(self, document_id: str, content: str, org_id: str, metadata: dict = None):
         """
-        Generate embeddings for a document
+        Generate embeddings for a document and build knowledge graph
 
         Args:
             document_id: Document ID
             content: Document content
             org_id: Organization ID
+            metadata: Document metadata (author, channel, etc.)
         """
         try:
             # Chunk and embed the document
@@ -316,6 +324,20 @@ class IngestionService:
                 }
 
                 self.supabase.table("embeddings").insert(embedding_data).execute()
+
+            # Build knowledge graph from document
+            try:
+                from services.kg_service import get_kg_service
+                kg_service = get_kg_service(self.supabase)
+                kg_service.build_kg_from_document(
+                    org_id=org_id,
+                    document_id=document_id,
+                    content=content,
+                    metadata=metadata or {}
+                )
+            except Exception as kg_error:
+                print(f"[KG] Failed to build graph for document {document_id}: {kg_error}")
+                # Don't fail the whole process if KG extraction fails
 
             # Update document status
             self.supabase.table("documents").update({
@@ -538,10 +560,17 @@ class IngestionService:
             document_id = doc.data[0]["id"]
             print(f"[REALTIME] Created document: {document_id}")
 
-            # Generate and insert embeddings
+            # Generate and insert embeddings + build KG
             try:
-                await self._generate_embeddings(document_id, text, org_id)
-                print(f"[REALTIME] Generated embeddings for document: {document_id}")
+                event_metadata = {
+                    "author": author,
+                    "author_id": user_id,
+                    "channel_name": channel_name,
+                    "channel_id": channel_id,
+                    "source_type": "slack"
+                }
+                await self._generate_embeddings(document_id, text, org_id, event_metadata)
+                print(f"[REALTIME] Generated embeddings and built KG for document: {document_id}")
             except Exception as e:
                 print(f"[REALTIME] Failed to generate embeddings: {e}")
 

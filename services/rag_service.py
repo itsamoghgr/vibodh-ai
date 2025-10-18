@@ -104,23 +104,79 @@ class RAGService:
                 print(f"[MEMORY ERROR] Failed to retrieve memories: {e}")
             return []
 
-    def retrieve_context(
-        self, query: str, org_id: str, limit: int = 5, threshold: float = 0.3
+    def retrieve_graph_context(
+        self, query: str, org_id: str, limit: int = 3
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve relevant context for a query using semantic search
+        Retrieve context from knowledge graph based on query
+
+        Args:
+            query: User's question
+            org_id: Organization ID
+            limit: Max number of graph results
+
+        Returns:
+            List of graph context items
+        """
+        try:
+            from services.kg_service import get_kg_service
+            kg_service = get_kg_service(self.supabase)
+
+            # Extract potential entity names from query (simple approach)
+            # Look for capitalized words that might be names
+            import re
+            potential_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', query)
+
+            # Also check for common question patterns
+            query_lower = query.lower()
+
+            graph_results = []
+
+            # Query graph for each potential entity
+            for entity_name in potential_entities[:3]:  # Limit to first 3 entities
+                relations = kg_service.query_related_entities(org_id, entity_name)
+
+                if relations:
+                    for rel in relations[:limit]:
+                        graph_results.append({
+                            "type": "graph",
+                            "entity": entity_name,
+                            "relation": rel["relation"],
+                            "related_entity": rel["related_entity_name"],
+                            "related_type": rel["related_entity_type"],
+                            "direction": rel["direction"],
+                            "confidence": rel["confidence"]
+                        })
+
+            if DEBUG:
+                print(f"[GRAPH] Found {len(graph_results)} graph relationships")
+
+            return graph_results[:limit]
+
+        except Exception as e:
+            if DEBUG:
+                print(f"[GRAPH ERROR] {str(e)}")
+            return []
+
+    def retrieve_context(
+        self, query: str, org_id: str, limit: int = 5, threshold: float = 0.3, use_hybrid: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve relevant context using hybrid retrieval (vector + graph)
 
         Args:
             query: User's question
             org_id: Organization ID
             limit: Max number of context items
             threshold: Similarity threshold (default 0.3 for better recall)
+            use_hybrid: Whether to include graph context (default True)
 
         Returns:
-            List of context items with document info
+            List of context items with document info and graph relationships
         """
         import numpy as np
 
+        # Step 1: Semantic search using vectors
         # Generate embedding for the query
         query_embedding = self.embedding_service.generate_embedding(query)
         query_vector = np.array(query_embedding)
@@ -221,6 +277,17 @@ class RAGService:
                 result["created_at"] = doc.data.get("created_at")
 
             enriched_results.append(result)
+
+        # Step 2: Add graph context if hybrid mode is enabled
+        if use_hybrid:
+            graph_results = self.retrieve_graph_context(query, org_id, limit=3)
+
+            # Add graph results to enriched_results
+            for graph_item in graph_results:
+                enriched_results.append(graph_item)
+
+            if DEBUG and graph_results:
+                print(f"[HYBRID] Combined {len(top_results)} vector results + {len(graph_results)} graph results")
 
         return enriched_results
 

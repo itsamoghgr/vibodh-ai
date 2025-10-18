@@ -1150,11 +1150,176 @@ async def slack_events(
 # STARTUP & SHUTDOWN
 # ============================================
 
+# ============================================
+# KNOWLEDGE GRAPH ROUTES
+# ============================================
+
+@app.post("/api/kg/build/{org_id}")
+async def build_knowledge_graph(org_id: str, limit: int = Query(default=100, ge=1, le=1000)):
+    """
+    Build or rebuild knowledge graph for an organization
+    Processes existing documents to extract entities and relationships
+    """
+    try:
+        from services.kg_service import get_kg_service
+        kg_service = get_kg_service(supabase)
+
+        # Get documents for this org
+        docs_result = supabase.table("documents")\
+            .select("id, content, author, author_id, channel_name, channel_id, source_type")\
+            .eq("org_id", org_id)\
+            .eq("embedding_status", "completed")\
+            .order("created_at", desc=True)\
+            .limit(limit)\
+            .execute()
+
+        if not docs_result.data:
+            return {
+                "success": True,
+                "message": "No documents found to process",
+                "processed": 0
+            }
+
+        total_entities = 0
+        total_relations = 0
+
+        for doc in docs_result.data:
+            metadata = {
+                "author": doc.get("author"),
+                "author_id": doc.get("author_id"),
+                "channel_name": doc.get("channel_name"),
+                "channel_id": doc.get("channel_id"),
+                "source_type": doc.get("source_type")
+            }
+
+            result = kg_service.build_kg_from_document(
+                org_id=org_id,
+                document_id=doc["id"],
+                content=doc["content"],
+                metadata=metadata
+            )
+
+            total_entities += result["entities_created"]
+            total_relations += result["relations_created"]
+
+        return {
+            "success": True,
+            "message": f"Processed {len(docs_result.data)} documents",
+            "documents_processed": len(docs_result.data),
+            "entities_created": total_entities,
+            "relations_created": total_relations
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"KG build failed: {str(e)}")
+
+@app.get("/api/kg/query/{org_id}")
+async def query_knowledge_graph(
+    org_id: str,
+    entity: str = Query(..., description="Entity name to query"),
+    relation: str = Query(None, description="Optional relation type filter")
+):
+    """
+    Query relationships for a specific entity
+    """
+    try:
+        from services.kg_service import get_kg_service
+        kg_service = get_kg_service(supabase)
+
+        results = kg_service.query_related_entities(org_id, entity, relation)
+
+        return {
+            "entity": entity,
+            "relation_filter": relation,
+            "relationships": results
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"KG query failed: {str(e)}")
+
+@app.get("/api/kg/stats/{org_id}")
+async def get_kg_stats(org_id: str):
+    """
+    Get knowledge graph statistics for an organization
+    """
+    try:
+        from services.kg_service import get_kg_service
+        kg_service = get_kg_service(supabase)
+
+        stats = kg_service.get_kg_stats(org_id)
+
+        return stats
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get KG stats: {str(e)}")
+
+@app.get("/api/kg/entities/{org_id}")
+async def get_entities(
+    org_id: str,
+    entity_type: str = Query(None, description="Filter by entity type"),
+    limit: int = Query(default=50, ge=1, le=200)
+):
+    """
+    Get entities from the knowledge graph
+    """
+    try:
+        query = supabase.table("kg_entities")\
+            .select("*")\
+            .eq("org_id", org_id)\
+            .order("created_at", desc=True)\
+            .limit(limit)
+
+        if entity_type:
+            query = query.eq("type", entity_type)
+
+        result = query.execute()
+
+        return {
+            "entities": result.data if result.data else [],
+            "count": len(result.data) if result.data else 0
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get entities: {str(e)}")
+
+@app.get("/api/kg/edges/{org_id}")
+async def get_edges(
+    org_id: str,
+    relation: str = Query(None, description="Filter by relation type"),
+    limit: int = Query(default=50, ge=1, le=200)
+):
+    """
+    Get relationship edges from the knowledge graph
+    """
+    try:
+        query = supabase.table("kg_edges")\
+            .select("*, source:kg_entities!kg_edges_source_id_fkey(name, type), target:kg_entities!kg_edges_target_id_fkey(name, type)")\
+            .eq("org_id", org_id)\
+            .order("created_at", desc=True)\
+            .limit(limit)
+
+        if relation:
+            query = query.eq("relation", relation)
+
+        result = query.execute()
+
+        return {
+            "edges": result.data if result.data else [],
+            "count": len(result.data) if result.data else 0
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get edges: {str(e)}")
+
+# ============================================
+# STARTUP / SHUTDOWN EVENTS
+# ============================================
+
 @app.on_event("startup")
 async def startup_event():
     """Run on application startup"""
     print("=" * 50)
-    print("Vibodh AI API - Phase 1, Step 2")
+    print("Vibodh AI API - Phase 2, Step 2")
     print("=" * 50)
     print(f"Supabase: {SUPABASE_URL}")
     print(f"OpenAI: {'Configured' if os.getenv('OPENAI_API_KEY') else 'NOT configured'}")
@@ -1163,6 +1328,7 @@ async def startup_event():
     print("=" * 50)
     print("Ready to receive requests!")
     print("API Docs: http://localhost:8000/docs")
+    print("Knowledge Graph: ENABLED")
     print("=" * 50)
 
 @app.on_event("shutdown")
