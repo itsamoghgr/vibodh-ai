@@ -310,6 +310,12 @@ class IngestionService:
             metadata: Document metadata (author, channel, etc.)
         """
         try:
+            # Delete existing embeddings for this document (if any)
+            self.supabase.table("embeddings")\
+                .delete()\
+                .eq("document_id", document_id)\
+                .execute()
+
             # Chunk and embed the document
             embedded_chunks = self.embedding_service.embed_document(content)
 

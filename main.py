@@ -1383,6 +1383,365 @@ async def get_insight_stats(org_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to get insight stats: {str(e)}")
 
 # ============================================
+# CLICKUP INTEGRATION ROUTES
+# ============================================
+
+@app.get("/api/clickup/connect")
+async def clickup_connect(org_id: str = Query(...)):
+    """
+    Initiate ClickUp OAuth 2.0 flow
+
+    Redirects user to ClickUp authorization page.
+    """
+    try:
+        from services.clickup_service import get_clickup_service
+        clickup_service = get_clickup_service(supabase)
+
+        # Generate state parameter (org_id for simplicity, should use JWT in production)
+        state = org_id
+
+        # Get authorization URL
+        auth_url = clickup_service.get_authorization_url(state)
+
+        return RedirectResponse(url=auth_url)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to initiate ClickUp OAuth: {str(e)}")
+
+
+@app.get("/api/clickup/callback")
+async def clickup_callback(
+    code: str = Query(...),
+    state: str = Query(...)
+):
+    """
+    ClickUp OAuth callback endpoint
+
+    Exchanges authorization code for access token and stores in connections table.
+    """
+    try:
+        from services.clickup_service import get_clickup_service
+        clickup_service = get_clickup_service(supabase)
+
+        org_id = state  # Extract org_id from state parameter
+
+        # Exchange code for access token
+        token_data = clickup_service.exchange_code_for_token(code)
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Failed to obtain access token")
+
+        # Get authorized user info
+        user_info = clickup_service.get_authorized_user(access_token)
+
+        # Get user's workspaces
+        workspaces = clickup_service.get_workspaces(access_token)
+
+        if not workspaces:
+            raise HTTPException(status_code=400, detail="No ClickUp workspaces found")
+
+        # Use first workspace (or let user select in production)
+        workspace = workspaces[0]
+        workspace_id = workspace.get("id")
+        workspace_name = workspace.get("name")
+
+        # Store connection in Supabase
+        connection_data = {
+            "org_id": org_id,
+            "source_type": "clickup",
+            "access_token": access_token,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+            "metadata": {
+                "user_id": user_info.get("user", {}).get("id"),
+                "user_email": user_info.get("user", {}).get("email"),
+                "workspace": workspace
+            }
+        }
+
+        result = supabase.table("connections").insert(connection_data).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to store connection")
+
+        connection_id = result.data[0]["id"]
+
+        # Redirect to frontend integrations page with success message
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        return RedirectResponse(url=f"{frontend_url}/dashboard/integrations?clickup=connected")
+
+    except Exception as e:
+        # Redirect to frontend with error
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        return RedirectResponse(url=f"{frontend_url}/dashboard/integrations?clickup=error&message={str(e)}")
+
+
+@app.post("/api/clickup/sync/{connection_id}")
+async def clickup_sync(connection_id: str, org_id: str = Query(...)):
+    """
+    Manually trigger ClickUp data sync
+
+    Fetches all tasks and comments from connected ClickUp workspace and ingests them.
+    """
+    try:
+        from services.clickup_service import get_clickup_service
+        from services.ingestion_service import get_ingestion_service
+        import traceback
+
+        clickup_service = get_clickup_service(supabase)
+        ingestion_service = get_ingestion_service(supabase)
+
+        # Fetch all tasks
+        print("[SYNC] Fetching all tasks from ClickUp")
+        tasks_data = clickup_service.fetch_all_tasks(connection_id, org_id)
+        print(f"[SYNC] Fetched {len(tasks_data)} tasks")
+
+        # Normalize and ingest each task
+        documents_ingested = 0
+        for idx, task_data in enumerate(tasks_data):
+            try:
+                print(f"[SYNC] Processing task {idx+1}/{len(tasks_data)}")
+                document = clickup_service.normalize_task_to_document(task_data, org_id, connection_id)
+            except Exception as e:
+                print(f"[SYNC] ERROR normalizing task {idx+1}: {type(e).__name__}: {e}")
+                print(f"[SYNC] Traceback: {traceback.format_exc()}")
+                raise
+
+            # Check if document already exists
+            existing = supabase.table("documents")\
+                .select("id")\
+                .eq("org_id", org_id)\
+                .eq("source_type", "clickup")\
+                .eq("source_id", document["source_id"])\
+                .execute()
+
+            if existing.data:
+                # Update existing document
+                supabase.table("documents")\
+                    .update(document)\
+                    .eq("id", existing.data[0]["id"])\
+                    .execute()
+
+                # Re-generate embeddings for updated document
+                doc_id = existing.data[0]["id"]
+                doc_metadata = {
+                    "author": document.get("author"),
+                    "author_id": document.get("author_id"),
+                    "source_type": "clickup",
+                    "task_id": document.get("metadata", {}).get("task_id"),
+                    "space_name": document.get("metadata", {}).get("space_name"),
+                    "list_name": document.get("metadata", {}).get("list_name")
+                }
+                await ingestion_service._generate_embeddings(doc_id, document["content"], org_id, doc_metadata)
+            else:
+                # Add embedding_status to document
+                document["embedding_status"] = "pending"
+
+                # Insert new document
+                result = supabase.table("documents").insert(document).execute()
+
+                if result.data:
+                    doc_id = result.data[0]["id"]
+
+                    # Generate embeddings
+                    doc_metadata = {
+                        "author": document.get("author"),
+                        "author_id": document.get("author_id"),
+                        "source_type": "clickup",
+                        "task_id": document.get("metadata", {}).get("task_id"),
+                        "space_name": document.get("metadata", {}).get("space_name"),
+                        "list_name": document.get("metadata", {}).get("list_name")
+                    }
+                    await ingestion_service._generate_embeddings(doc_id, document["content"], org_id, doc_metadata)
+                    documents_ingested += 1
+
+        # Update connection last_sync_at
+        from datetime import datetime
+        supabase.table("connections").update({
+            "last_sync_at": datetime.utcnow().isoformat()
+        }).eq("id", connection_id).execute()
+
+        # After successful initial sync, set up webhook for real-time updates
+        try:
+            # Get connection details
+            conn_result = supabase.table("connections")\
+                .select("*")\
+                .eq("id", connection_id)\
+                .execute()
+
+            if conn_result.data:
+                connection = conn_result.data[0]
+                access_token = connection.get("access_token")
+                workspace_id = connection.get("workspace_id")
+
+                # Check if webhook already exists
+                webhook_exists = connection.get("metadata", {}).get("webhook_id")
+
+                if not webhook_exists and access_token and workspace_id:
+                    # Create webhook for real-time updates
+                    webhook_url = os.getenv("CLICKUP_WEBHOOK_URL", f"{os.getenv('BACKEND_URL', 'http://localhost:8000')}/api/clickup/webhook")
+
+                    webhook_events = [
+                        "taskCreated",
+                        "taskUpdated",
+                        "taskDeleted",
+                        "taskCommentPosted"
+                    ]
+
+                    print(f"[SYNC] Setting up webhook at {webhook_url}")
+                    webhook_response = clickup_service.create_webhook(
+                        access_token=access_token,
+                        team_id=workspace_id,
+                        endpoint=webhook_url,
+                        events=webhook_events
+                    )
+
+                    webhook_id = webhook_response.get("id")
+
+                    # Update connection metadata with webhook info
+                    supabase.table("connections").update({
+                        "metadata": {
+                            **connection.get("metadata", {}),
+                            "webhook_id": webhook_id,
+                            "webhook_active": True,
+                            "webhook_url": webhook_url,
+                            "webhook_events": webhook_events
+                        }
+                    }).eq("id", connection_id).execute()
+
+                    print(f"[SYNC] ✓ Webhook created successfully (ID: {webhook_id})")
+        except Exception as webhook_error:
+            # Don't fail the sync if webhook setup fails
+            print(f"[SYNC] Warning: Failed to set up webhook: {webhook_error}")
+
+        return {
+            "success": True,
+            "message": f"Synced {len(tasks_data)} tasks from ClickUp",
+            "documents_ingested": documents_ingested
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ClickUp sync failed: {str(e)}")
+
+
+@app.post("/api/clickup/webhook")
+async def clickup_webhook(request: Request):
+    """
+    ClickUp webhook endpoint for real-time updates
+
+    Receives events from ClickUp when tasks are created/updated/deleted.
+    """
+    try:
+        from services.clickup_service import get_clickup_service
+        from services.ingestion_service import get_ingestion_service
+
+        clickup_service = get_clickup_service(supabase)
+        ingestion_service = get_ingestion_service(supabase)
+
+        # Parse webhook payload
+        payload = await request.json()
+
+        event = payload.get("event")
+        task_id = payload.get("task_id")
+        workspace_id = payload.get("workspace_id")
+
+        if not event or not task_id or not workspace_id:
+            raise HTTPException(status_code=400, detail="Invalid webhook payload")
+
+        # Find connection for this workspace
+        conn_result = supabase.table("connections")\
+            .select("*")\
+            .eq("source_type", "clickup")\
+            .eq("workspace_id", workspace_id)\
+            .execute()
+
+        if not conn_result.data:
+            return {"success": True, "message": "No active connection for this workspace"}
+
+        connection = conn_result.data[0]
+        connection_id = connection["id"]
+        org_id = connection["org_id"]
+        access_token = connection["access_token"]
+
+        # Handle different event types
+        if event in ["taskCreated", "taskUpdated"]:
+            # Fetch task details
+            task = payload.get("task", {})
+
+            # Fetch comments
+            comments = clickup_service.get_task_comments(access_token, task_id)
+
+            # Build task_data structure
+            task_data = {
+                "task": task,
+                "space_name": task.get("space", {}).get("name", "Unknown"),
+                "list_name": task.get("list", {}).get("name", "Unknown"),
+                "comments": comments
+            }
+
+            # Normalize to document
+            document = clickup_service.normalize_task_to_document(task_data, org_id, connection_id)
+
+            # Check if document exists
+            existing = supabase.table("documents")\
+                .select("id")\
+                .eq("org_id", org_id)\
+                .eq("source_type", "clickup")\
+                .eq("source_id", task_id)\
+                .execute()
+
+            if existing.data:
+                # Update existing
+                supabase.table("documents")\
+                    .update(document)\
+                    .eq("id", existing.data[0]["id"])\
+                    .execute()
+
+                # Regenerate embeddings
+                doc_id = existing.data[0]["id"]
+                doc_metadata = {
+                    "author": document.get("author"),
+                    "author_id": document.get("author_id"),
+                    "source_type": "clickup",
+                    "task_id": document.get("metadata", {}).get("task_id"),
+                    "space_name": document.get("metadata", {}).get("space_name"),
+                    "list_name": document.get("metadata", {}).get("list_name")
+                }
+                await ingestion_service._generate_embeddings(doc_id, document["content"], org_id, doc_metadata)
+            else:
+                # Add embedding_status to document
+                document["embedding_status"] = "pending"
+
+                # Insert new
+                result = supabase.table("documents").insert(document).execute()
+                if result.data:
+                    doc_id = result.data[0]["id"]
+                    doc_metadata = {
+                        "author": document.get("author"),
+                        "author_id": document.get("author_id"),
+                        "source_type": "clickup",
+                        "task_id": document.get("metadata", {}).get("task_id"),
+                        "space_name": document.get("metadata", {}).get("space_name"),
+                        "list_name": document.get("metadata", {}).get("list_name")
+                    }
+                    await ingestion_service._generate_embeddings(doc_id, document["content"], org_id, doc_metadata)
+
+        elif event == "taskDeleted":
+            # Delete document
+            supabase.table("documents")\
+                .delete()\
+                .eq("org_id", org_id)\
+                .eq("source_type", "clickup")\
+                .eq("source_id", task_id)\
+                .execute()
+
+        return {"success": True, "event": event, "task_id": task_id}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
+
+# ============================================
 # STARTUP / SHUTDOWN EVENTS
 # ============================================
 
@@ -1401,6 +1760,7 @@ async def startup_event():
     print("API Docs: http://localhost:8000/docs")
     print("Knowledge Graph: ENABLED")
     print("AI Insights: ENABLED")
+    print("ClickUp Integration: ENABLED")
     print("=" * 50)
 
 @app.on_event("shutdown")

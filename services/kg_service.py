@@ -44,13 +44,60 @@ class KGService:
         """
         # Build prompt with metadata context
         context = ""
+        source_type = "message"
+
         if metadata:
             if metadata.get("author"):
                 context += f"\nAuthor: {metadata['author']}"
             if metadata.get("channel_name"):
                 context += f"\nChannel: {metadata['channel_name']}"
+            if metadata.get("space_name"):
+                context += f"\nSpace: {metadata['space_name']}"
+                source_type = "task"
+            if metadata.get("list_name"):
+                context += f"\nList: {metadata['list_name']}"
+            if metadata.get("status"):
+                context += f"\nStatus: {metadata['status']}"
+            if metadata.get("assignees"):
+                assignees = metadata['assignees']
+                if isinstance(assignees, list) and assignees:
+                    context += f"\nAssignees: {', '.join(assignees)}"
 
-        prompt = f"""Extract entities and relationships from this Slack message.
+        # Customize prompt based on source type
+        if source_type == "task":
+            prompt = f"""Extract entities and relationships from this ClickUp task.
+
+{context}
+
+Task:
+{text}
+
+Extract:
+1. People (names of team members, assignees)
+2. Projects (specific projects, features, or initiatives)
+3. Topics (technical topics, tools, technologies)
+4. Issues (bugs, blockers, problems)
+5. Relationships between entities (who works on what, what blocks what, who is assigned to what)
+
+Return ONLY valid JSON in this exact format:
+{{
+  "entities": [
+    {{"name": "John Doe", "type": "person"}},
+    {{"name": "auth system", "type": "project"}},
+    {{"name": "React", "type": "topic"}}
+  ],
+  "relations": [
+    {{"source": "John Doe", "relation": "assigned_to", "target": "auth system", "confidence": 0.9}},
+    {{"source": "John Doe", "relation": "discussed", "target": "React", "confidence": 0.8}}
+  ]
+}}
+
+Types: person, project, topic, tool, issue
+Relations: assigned_to, works_on, discussed, fixed, blocked_by, uses, created, mentioned, commented_on
+
+Return empty arrays if nothing found. JSON only, no explanation."""
+        else:
+            prompt = f"""Extract entities and relationships from this message.
 
 {context}
 
