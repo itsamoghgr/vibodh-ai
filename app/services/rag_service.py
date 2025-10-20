@@ -9,6 +9,7 @@ from typing import List, Dict, Any, AsyncGenerator, Optional
 from supabase import Client
 from app.services.embedding_service import get_embedding_service
 from app.services.llm_service import get_llm_service
+from app.services.memory_service import get_memory_service
 from datetime import datetime, timedelta
 from app.core.config import settings
 
@@ -61,14 +62,16 @@ class RAGService:
         self.supabase = supabase_client
         self.embedding_service = get_embedding_service()
         self.llm_service = get_llm_service()
+        self.memory_service = get_memory_service(supabase_client)
 
-    def retrieve_memory(
-        self, org_id: str, user_id: Optional[str] = None, limit: int = 3
+    async def retrieve_memory(
+        self, query: str, org_id: str, user_id: Optional[str] = None, limit: int = 3
     ) -> List[Dict[str, Any]]:
         """
-        Retrieve recent important memories before RAG retrieval
+        Retrieve relevant memories using semantic search
 
         Args:
+            query: User's question for semantic search
             org_id: Organization ID
             user_id: Optional user ID for personalized memories
             limit: Max memories to retrieve
@@ -77,27 +80,19 @@ class RAGService:
             List of memory entries
         """
         try:
-            query = (
-                self.supabase.table("ai_memory")
-                .select("*")
-                .eq("org_id", org_id)
-                .order("importance", desc=True)
-                .order("created_at", desc=True)
-                .limit(limit)
+            # Use memory service for semantic search
+            memories = await self.memory_service.retrieve_relevant_memories(
+                org_id=org_id,
+                query=query,
+                limit=limit,
+                min_importance=0.3,
+                user_id=user_id
             )
 
-            # Filter by user if provided
-            if user_id:
-                query = query.eq("user_id", user_id)
-
-            result = query.execute()
-
             if DEBUG:
-                print(
-                    f"[MEMORY] Retrieved {len(result.data) if result.data else 0} memory entries"
-                )
+                print(f"[MEMORY] Retrieved {len(memories)} relevant memories via semantic search")
 
-            return result.data if result.data else []
+            return memories
 
         except Exception as e:
             if DEBUG:
@@ -356,52 +351,6 @@ class RAGService:
 
         return enriched_results
 
-    async def store_memory(
-        self,
-        org_id: str,
-        title: str,
-        content: str,
-        memory_type: str = "conversation",
-        importance: float = 0.5,
-        user_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ):
-        """
-        Store a memory entry after a conversation
-
-        Args:
-            org_id: Organization ID
-            title: Short title/summary
-            content: Full content
-            memory_type: Type of memory (conversation, insight, decision, update)
-            importance: Importance score 0-1
-            user_id: Optional user ID
-            metadata: Optional metadata dict
-        """
-        try:
-            memory_data = {
-                "org_id": org_id,
-                "user_id": user_id,
-                "memory_type": memory_type,
-                "title": title,
-                "content": content,
-                "importance": max(0.0, min(1.0, importance)),  # Clamp to [0, 1]
-                "metadata": metadata or {},
-            }
-
-            result = self.supabase.table("ai_memory").insert(memory_data).execute()
-
-            if DEBUG:
-                print(
-                    f"[MEMORY STORED] Type: {memory_type}, Importance: {importance:.2f}, Title: {title}"
-                )
-
-            return result.data[0] if result.data else None
-
-        except Exception as e:
-            if DEBUG:
-                print(f"[MEMORY ERROR] Failed to store memory: {e}")
-            return None
 
     async def generate_answer_stream(
         self,
@@ -430,8 +379,10 @@ class RAGService:
         simple_queries = ["hi", "hello", "hey", "thanks", "thank you", "bye", "goodbye", "ok", "okay"]
         is_simple_query = query.lower().strip() in simple_queries or len(query.strip()) < 10
 
-        # Step 1: Retrieve important memories first
-        memories = self.retrieve_memory(org_id, user_id, limit=3)
+        # Step 1: Retrieve relevant memories using semantic search
+        memories = []
+        if not is_simple_query:
+            memories = await self.retrieve_memory(query, org_id, user_id, limit=3)
 
         # Step 2: Retrieve context (skip for simple queries)
         context_items = []
@@ -550,11 +501,11 @@ Please answer based on the above context.""",
             full_response += chunk
             yield chunk
 
-        # Step 3: Post-answer summarization - store important insights
+        # Step 3: Post-answer summarization - store important insights using memory service
         # Only store if the response is substantial and not a simple greeting
         if not is_simple_query and len(full_response) > 50 and len(query) > 10:
-            # Generate a short summary title (first 100 chars of response)
-            summary_title = full_response[:100].strip()
+            # Generate a short summary title (first 100 chars of query)
+            summary_title = query[:100].strip()
             if len(summary_title) > 97:
                 summary_title = summary_title[:97] + "..."
 
@@ -563,13 +514,14 @@ Please answer based on the above context.""",
                 0.5 + (len(full_response) / 1000) * 0.3, 0.9
             )  # Max 0.9
 
-            await self.store_memory(
+            # Store using memory service for embedding generation
+            await self.memory_service.store_memory(
                 org_id=org_id,
-                user_id=user_id,
                 title=summary_title,
-                content=f"Q: {query}\nA: {full_response}",
+                content=f"Q: {query}\n\nA: {full_response}",
                 memory_type="conversation",
                 importance=importance,
+                user_id=user_id,
                 metadata={
                     "query_length": len(query),
                     "response_length": len(full_response),

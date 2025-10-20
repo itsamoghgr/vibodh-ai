@@ -6,6 +6,7 @@ from .insight_service import InsightService, get_insight_service
 from .orchestrator_service import OrchestratorService, get_orchestrator_service
 from .ingestion_service import IngestionService, get_ingestion_service
 from .embedding_service import EmbeddingService, get_embedding_service
+from .meta_learning_service import MetaLearningService, get_meta_learning_service
 
 __all__ = [
     "RAGService",
@@ -20,4 +21,6 @@ __all__ = [
     "get_ingestion_service",
     "EmbeddingService",
     "get_embedding_service",
+    "MetaLearningService",
+    "get_meta_learning_service",
 ]

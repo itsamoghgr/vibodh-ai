@@ -56,10 +56,34 @@
 ### 🎯 **Orchestrator (Cognitive Core)**
 - **Intent Classification**: Automatically routes queries (question, task, summary, insight, risk)
 - **Multi-Module Routing**: Intelligently selects RAG, KG, Insights modules based on intent
+- **Meta-Rule Application**: Applies discovered patterns to refine module selection (Phase 3, Step 4)
 - **Context Aggregation**: Combines results from multiple modules
 - **Reasoning Chain**: Logs decision steps for transparency
 - **Parallel Execution**: Runs module queries concurrently for speed
 - **Synthesis**: LLM-powered final response generation
+
+### 🧬 **Meta-Learning & Knowledge Evolution** (Phase 3, Step 4)
+- **Reasoning Pattern Analysis**: Discovers which module combinations work best for each intent type
+- **Meta-Rule Generation**: Creates rules like "For risk queries → KG + Insights (85% success)"
+- **Dynamic Orchestration**: Applies meta-rules to refine module routing at runtime
+- **KG Schema Evolution**: Proposes new entity/relation types based on data patterns
+- **Model Snapshots**: Tracks configuration states before/after optimization cycles
+- **Trend Detection**: LLM-powered analysis of emerging topics and recurring concepts
+- **Nightly Analysis**: Automatic pattern discovery running at 2 AM UTC
+- **Self-Evolution**: AI that learns how to learn and continuously improves
+
+### 🔄 **Adaptive Reasoning** (Phase 3, Step 3)
+- **Performance Tracking**: Monitors accuracy, response time, user feedback
+- **Automatic Optimization**: Adjusts module weights and LLM parameters
+- **Self-Reflection**: Nightly analysis of "what went right/wrong"
+- **A/B Testing**: Compares configuration changes
+- **Feedback Loop**: Continuous improvement based on results
+
+### 💾 **Long-Term Memory** (Phase 3, Step 2)
+- **Memory Consolidation**: Nightly aggregation with importance decay
+- **Access Tracking**: Boosts frequently used memories
+- **Embedding-Based Retrieval**: Semantic memory search
+- **Expiration Management**: Auto-expires low-importance memories
 
 ### 🏗️ **Architecture**
 
@@ -152,6 +176,30 @@
 - `POST /search` - Semantic search with context
 - `POST /generate` - Generate answer using RAG
 
+### Memory (`/api/v1/memory`)
+- `POST /store` - Store memory
+- `GET /retrieve` - Retrieve memories by query
+- `POST /consolidate` - Trigger memory consolidation
+
+### Adaptive (`/api/v1/adaptive`)
+- `GET /config` - Get adaptive configuration
+- `POST /optimize` - Run optimization cycle
+- `GET /performance` - Get performance metrics
+- `GET /history` - Get optimization history
+
+### Meta-Learning (`/api/v1/meta-learning`) - Phase 3, Step 4
+- `POST /analyze` - Trigger meta-learning analysis
+- `GET /rules` - Get discovered meta-rules
+- `GET /patterns` - Get reasoning pattern statistics
+- `GET /kg-evolution` - Get KG schema evolution history
+- `POST /kg-evolution/propose` - Propose schema changes
+- `POST /kg-evolution/approve` - Approve schema change
+- `POST /kg-evolution/reject` - Reject schema change
+- `GET /snapshots` - Get model configuration snapshots
+- `POST /snapshot/create` - Create new snapshot
+- `GET /trends` - Get detected data trends
+- `GET /schema-version` - Get current KG schema version
+
 ---
 
 ## Tech Stack
@@ -207,7 +255,11 @@ vibodh-ai/
 │   │   ├── embedding_service.py
 │   │   ├── llm_service.py
 │   │   ├── ingestion_service.py
-│   │   └── clickup_service.py
+│   │   ├── clickup_service.py
+│   │   ├── memory_service.py
+│   │   ├── adaptive_engine.py
+│   │   ├── feedback_service.py
+│   │   └── meta_learning_service.py  # NEW!
 │   ├── connectors/             # Integration abstractions
 │   │   ├── slack_connector.py
 │   │   └── clickup_connector.py
@@ -221,7 +273,10 @@ vibodh-ai/
 │   │   ├── routes_connections.py
 │   │   ├── routes_documents.py
 │   │   ├── routes_orchestrator.py
-│   │   └── routes_rag.py
+│   │   ├── routes_rag.py
+│   │   ├── routes_memory.py
+│   │   ├── routes_adaptive.py
+│   │   └── routes_meta_learning.py  # NEW!
 │   ├── utils/                  # Utilities
 │   └── tests/                  # Test suite
 │       ├── unit/

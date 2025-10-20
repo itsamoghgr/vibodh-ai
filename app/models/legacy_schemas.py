@@ -39,6 +39,7 @@ class ChatSessionResponse(BaseModel):
     title: Optional[str]
     created_at: datetime
     updated_at: datetime
+    messages: Optional[List[Dict[str, Any]]] = []
 
 
 class ChatMessageResponse(BaseModel):

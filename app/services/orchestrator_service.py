@@ -14,7 +14,12 @@ from supabase import Client
 from app.services.rag_service import get_rag_service
 from app.services.kg_service import get_kg_service
 from app.services.insight_service import get_insight_service
+from app.services.memory_service import get_memory_service
+from app.services.feedback_service import get_feedback_service
+from app.services.adaptive_engine import get_adaptive_engine
+from app.services.meta_learning_service import get_meta_learning_service
 from app.core.config import settings
+from app.core.logging import logger as app_logger
 import requests
 
 
@@ -24,6 +29,10 @@ class OrchestratorService:
         self.rag_service = get_rag_service(supabase)
         self.kg_service = get_kg_service(supabase)
         self.insight_service = get_insight_service(supabase)
+        self.memory_service = get_memory_service(supabase)
+        self.feedback_service = get_feedback_service(supabase)
+        self.adaptive_engine = get_adaptive_engine(supabase)
+        self.meta_learning_service = get_meta_learning_service(supabase)
         self.groq_api_key = settings.GROQ_API_KEY
 
     def classify_intent(self, query: str) -> str:
@@ -82,9 +91,65 @@ Respond with ONLY the category name, nothing else."""
 
         return "question"  # Default fallback
 
+    def apply_meta_rules(self, query: str, intent: str, org_id: str, base_modules: List[str]) -> List[str]:
+        """
+        Apply discovered meta-rules to refine module selection.
+        Phase 3, Step 4: Meta-Learning integration
+
+        Args:
+            query: User query
+            intent: Classified intent
+            org_id: Organization ID
+            base_modules: Modules selected by heuristics
+
+        Returns:
+            Refined list of modules based on meta-rules
+        """
+        try:
+            # Get applicable meta-rules for this intent
+            meta_rules = self.meta_learning_service.get_applicable_meta_rules(
+                org_id=org_id,
+                intent=intent,
+                min_confidence=0.7
+            )
+
+            if not meta_rules:
+                return base_modules
+
+            # Apply the highest confidence rule
+            best_rule = max(meta_rules, key=lambda r: (r['success_rate'], r['confidence']))
+
+            # Extract recommended modules from metadata
+            recommended_modules_str = best_rule.get('metadata', {}).get('modules', '')
+            if recommended_modules_str:
+                recommended_modules = recommended_modules_str.split('+')
+
+                # Log meta-rule application
+                app_logger.info(
+                    f"[META-LEARNING] Applying rule for '{intent}': {best_rule['rule_text'][:80]}"
+                )
+
+                # Update rule application stats
+                self.supabase.table('ai_meta_knowledge')\
+                    .update({
+                        'application_count': best_rule['application_count'] + 1,
+                        'last_applied_at': datetime.now().isoformat()
+                    })\
+                    .eq('id', best_rule['id'])\
+                    .execute()
+
+                return recommended_modules
+
+            return base_modules
+
+        except Exception as e:
+            app_logger.error(f"[META-LEARNING] Error applying meta-rules: {e}")
+            return base_modules
+
     def route_to_modules(self, query: str, intent: str, org_id: str) -> List[str]:
         """
         Determine which modules to use based on intent and query content.
+        Now enhanced with meta-learning (Phase 3, Step 4)
 
         Returns: List of module names to query
         """
@@ -106,7 +171,12 @@ Respond with ONLY the category name, nothing else."""
         if intent == "risk":
             modules.append("insight")
 
-        return list(set(modules))  # Remove duplicates
+        base_modules = list(set(modules))  # Remove duplicates
+
+        # Apply meta-rules to refine module selection (Phase 3, Step 4)
+        refined_modules = self.apply_meta_rules(query, intent, org_id, base_modules)
+
+        return refined_modules
 
     def execute_rag(self, query: str, org_id: str) -> Dict[str, Any]:
         """Execute RAG search and return results."""
@@ -239,19 +309,34 @@ Respond with ONLY the category name, nothing else."""
         query: str,
         intent: str,
         module_results: Dict[str, Any],
-        reasoning_steps: List[Dict[str, Any]]
+        reasoning_steps: List[Dict[str, Any]],
+        temperature: float = 0.7
     ) -> str:
         """
         Generate final LLM response using combined module results.
+
+        Args:
+            query: User query
+            intent: Classified intent
+            module_results: Results from all modules
+            reasoning_steps: Chain of reasoning
+            temperature: LLM temperature (adaptive)
         """
         # Build context from module results
         context_parts = []
+
+        # Add Memory context
+        memories = module_results.get("memories", [])
+        if memories:
+            context_parts.append("=== Relevant Memories ===")
+            for idx, memory in enumerate(memories[:3], 1):
+                context_parts.append(f"{idx}. [{memory.get('memory_type')}] {memory.get('title')}: {memory.get('content', '')[:150]}...")
 
         # Add RAG context
         if "rag" in module_results and module_results["rag"].get("success"):
             rag_results = module_results["rag"].get("results", [])
             if rag_results:
-                context_parts.append("=== Retrieved Documents ===")
+                context_parts.append("\n=== Retrieved Documents ===")
                 for idx, result in enumerate(rag_results[:3], 1):
                     context_parts.append(f"{idx}. {result.get('content', '')[:200]}...")
 
@@ -306,7 +391,7 @@ Provide a clear, well-structured response."""
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": query}
                     ],
-                    "temperature": 0.7,
+                    "temperature": temperature,
                     "max_tokens": 1000
                 }
             )
@@ -327,21 +412,43 @@ Provide a clear, well-structured response."""
         user_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Main orchestration method.
+        Main orchestration method with adaptive reasoning.
 
         Workflow:
-        1. Classify intent
-        2. Route to modules
-        3. Execute module queries
-        4. Build reasoning chain
-        5. Generate final response
-        6. Log reasoning
+        1. Load adaptive configuration
+        2. Retrieve relevant memories
+        3. Classify intent
+        4. Route to modules (using adaptive weights)
+        5. Execute module queries (with memory context)
+        6. Build reasoning chain
+        7. Generate final response (using adaptive LLM params)
+        8. Store conversation memory
+        9. Record performance metrics
+        10. Log reasoning
 
         Returns: Complete orchestration result
         """
         start_time = time.time()
 
         print(f"[ORCHESTRATOR] Processing query: {query}")
+
+        # Step 0a: Get adaptive configuration
+        adaptive_config = self.adaptive_engine.get_adaptive_config(org_id)
+        print(f"[ORCHESTRATOR] Using adaptive config: temp={adaptive_config['llm_temperature']}, max_items={adaptive_config['max_context_items']}")
+
+        # Step 0b: Retrieve relevant memories (using adaptive threshold)
+        memories = []
+        try:
+            memories = await self.memory_service.retrieve_relevant_memories(
+                org_id=org_id,
+                query=query,
+                limit=3,
+                min_importance=adaptive_config['memory_importance_threshold'],
+                user_id=user_id
+            )
+            print(f"[ORCHESTRATOR] Retrieved {len(memories)} relevant memories")
+        except Exception as e:
+            print(f"[ORCHESTRATOR] Failed to retrieve memories: {e}")
 
         # Step 1: Classify intent
         intent = self.classify_intent(query)
@@ -353,6 +460,10 @@ Provide a clear, well-structured response."""
 
         # Step 3: Execute module queries
         module_results = {}
+
+        # Include memories in module results
+        if memories:
+            module_results["memories"] = memories
 
         if "rag" in modules_to_use:
             module_results["rag"] = self.execute_rag(query, org_id)
@@ -366,14 +477,65 @@ Provide a clear, well-structured response."""
         # Step 4: Build reasoning chain
         reasoning_steps = self.build_reasoning_chain(query, intent, module_results)
 
-        # Step 5: Generate final response
-        final_answer = self.generate_final_response(query, intent, module_results, reasoning_steps)
+        # Step 5: Generate final response (using adaptive LLM params)
+        final_answer = self.generate_final_response(
+            query, intent, module_results, reasoning_steps,
+            temperature=adaptive_config['llm_temperature']
+        )
+
+        # Step 6: Store conversation memory
+        try:
+            # Determine importance based on intent and response length
+            importance_map = {
+                "task": 0.8,
+                "decision": 0.9,
+                "insight": 0.7,
+                "risk": 0.9,
+                "summary": 0.6,
+                "question": 0.4
+            }
+            importance = importance_map.get(intent, 0.5)
+
+            # Create concise memory title
+            memory_title = query[:80] + "..." if len(query) > 80 else query
+
+            # Store memory with response summary
+            memory_content = f"Query: {query}\n\nResponse: {final_answer[:300]}..."
+
+            await self.memory_service.store_memory(
+                org_id=org_id,
+                title=memory_title,
+                content=memory_content,
+                memory_type="conversation",
+                importance=importance,
+                user_id=user_id,
+                source_refs=[{"type": "orchestrator", "intent": intent}],
+                metadata={
+                    "intent": intent,
+                    "modules_used": modules_to_use,
+                    "execution_time_ms": int((time.time() - start_time) * 1000)
+                }
+            )
+            print(f"[ORCHESTRATOR] Stored conversation memory")
+        except Exception as e:
+            print(f"[ORCHESTRATOR] Failed to store memory: {e}")
 
         # Calculate execution time
         execution_time_ms = int((time.time() - start_time) * 1000)
 
         # Extract context sources
         context_sources = []
+
+        # Add memory sources
+        if memories:
+            for memory in memories[:3]:
+                context_sources.append({
+                    "type": "memory",
+                    "title": memory.get("title", "Untitled Memory"),
+                    "source": memory.get("memory_type", "conversation")
+                })
+
+        # Add document sources
         if "rag" in module_results and module_results["rag"].get("success"):
             for result in module_results["rag"].get("results", [])[:5]:
                 context_sources.append({
@@ -383,6 +545,7 @@ Provide a clear, well-structured response."""
                 })
 
         # Step 6: Log reasoning
+        reasoning_log_id = None
         try:
             log_data = {
                 "org_id": org_id,
@@ -398,10 +561,58 @@ Provide a clear, well-structured response."""
                 "tokens_used": len(final_answer.split())  # Rough estimate
             }
 
-            self.supabase.table("reasoning_logs").insert(log_data).execute()
+            log_result = self.supabase.table("reasoning_logs").insert(log_data).execute()
+            if log_result.data:
+                reasoning_log_id = log_result.data[0]["id"]
             print(f"[ORCHESTRATOR] Logged reasoning to database")
         except Exception as e:
             print(f"[ORCHESTRATOR] Failed to log reasoning: {e}")
+
+        # Step 7: Record performance metrics for adaptive learning
+        try:
+            # Calculate context relevance (avg of module success indicators)
+            context_relevance = 0.5  # Default
+            success_count = 0
+            total_modules = len(modules_to_use)
+
+            for module in modules_to_use:
+                if module in module_results and module_results[module].get("success"):
+                    success_count += 1
+
+            if total_modules > 0:
+                context_relevance = success_count / total_modules
+
+            # Calculate confidence based on response quality indicators
+            confidence_score = 0.7  # Default
+            if len(context_sources) > 3:  # Good context
+                confidence_score = 0.8
+            if len(memories) > 0:  # Has memory context
+                confidence_score += 0.1
+            confidence_score = min(1.0, confidence_score)
+
+            # Record feedback metrics (without user feedback yet)
+            await self.feedback_service.record_feedback(
+                org_id=org_id,
+                query=query,
+                intent=intent,
+                modules_used=modules_to_use,
+                response_time_ms=execution_time_ms,
+                token_usage=len(final_answer.split()),
+                confidence_score=confidence_score,
+                context_relevance_score=context_relevance,
+                context_items_used=len(context_sources),
+                reasoning_log_id=reasoning_log_id,
+                user_id=user_id,
+                metadata={
+                    "adaptive_config_used": {
+                        "temperature": adaptive_config['llm_temperature'],
+                        "max_context": adaptive_config['max_context_items']
+                    }
+                }
+            )
+            print(f"[ORCHESTRATOR] Recorded performance metrics")
+        except Exception as e:
+            print(f"[ORCHESTRATOR] Failed to record metrics: {e}")
 
         # Return complete result
         return {

@@ -8,7 +8,8 @@ from typing import Optional
 from app.models.legacy_schemas import ChatStreamRequest, ChatSessionResponse, ChatMessageResponse, FeedbackCreate
 
 from app.services import get_rag_service
-from app.db import supabase
+from app.services.orchestrator_service import OrchestratorService
+from app.db import supabase, supabase_admin
 from app.core.logging import logger
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
@@ -84,38 +85,57 @@ async def chat_stream(request: ChatStreamRequest):
         # Generate streaming response
         async def generate():
             import json
-            full_response = ""
+            import asyncio
 
             # Send session_id first
             yield f"data: {json.dumps({'session_id': session_id, 'type': 'session'})}\n\n"
 
-            # Send context (only if not a simple query and has context)
-            if context_items:
-                yield f"data: {json.dumps({'type': 'context', 'context': context_items})}\n\n"
+            # Use orchestrator for full reasoning and metrics tracking
+            orchestrator = OrchestratorService(supabase)
 
-            # Stream answer (with user_id for memory personalization and conversation history)
-            async for chunk in rag_service.generate_answer_stream(
-                query=request.query,
-                org_id=request.org_id,
-                max_context_items=request.max_context_items,
-                user_id=request.user_id,
-                conversation_history=conversation_history
-            ):
-                full_response += chunk
-                yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+            try:
+                logger.info(f"Chat stream: org_id={request.org_id}, user_id={request.user_id}, query={request.query[:50]}")
 
-            # Store assistant message (only if session exists)
-            if session_id:
-                assistant_message = {
-                    "session_id": session_id,
-                    "role": "assistant",
-                    "content": full_response,
-                }
-                # Only include context if there are items
-                if context_items and len(context_items) > 0:
-                    assistant_message["context"] = context_items
+                result = await orchestrator.orchestrate_query(
+                    query=request.query,
+                    org_id=request.org_id,
+                    user_id=request.user_id
+                )
 
-                supabase.table("chat_messages").insert(assistant_message).execute()
+                logger.info(f"Orchestrator result received, answer length: {len(result['final_answer'])}")
+
+                full_response = result['final_answer']
+                context_sources = result.get('context_sources', [])
+
+                # Send context
+                if context_sources:
+                    yield f"data: {json.dumps({'type': 'context', 'context': context_sources})}\n\n"
+
+                # Stream the response character by character for better UX
+                chunk_size = 5  # Stream 5 characters at a time
+                for i in range(0, len(full_response), chunk_size):
+                    chunk = full_response[i:i+chunk_size]
+                    yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+                    await asyncio.sleep(0.01)  # Small delay for streaming effect
+
+                # Store assistant message (only if session exists)
+                if session_id:
+                    assistant_message = {
+                        "session_id": session_id,
+                        "role": "assistant",
+                        "content": full_response,
+                    }
+                    # Only include context if there are items
+                    if context_sources and len(context_sources) > 0:
+                        assistant_message["context"] = context_sources
+
+                    supabase.table("chat_messages").insert(assistant_message).execute()
+
+            except Exception as e:
+                logger.error(f"Orchestrator error: {e}", exc_info=True)
+                # Send error message
+                error_msg = "I apologize, but I encountered an error processing your request."
+                yield f"data: {json.dumps({'type': 'token', 'content': error_msg})}\n\n"
 
             # Send done signal
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -152,8 +172,8 @@ async def get_chat_history(org_id: str, user_id: Optional[str] = None, limit: in
 async def get_chat_session(session_id: str):
     """Get a specific chat session with messages"""
     try:
-        # Get session
-        session = supabase.table("chat_sessions")\
+        # Get session (use admin to bypass RLS)
+        session = supabase_admin.table("chat_sessions")\
             .select("*")\
             .eq("id", session_id)\
             .single()\
@@ -162,8 +182,8 @@ async def get_chat_session(session_id: str):
         if not session.data:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Get messages
-        messages = supabase.table("chat_messages")\
+        # Get messages (use admin to bypass RLS)
+        messages = supabase_admin.table("chat_messages")\
             .select("*")\
             .eq("session_id", session_id)\
             .order("created_at", desc=False)\
@@ -176,6 +196,29 @@ async def get_chat_session(session_id: str):
 
     except Exception as e:
         logger.error(f"Get chat session error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session and all its messages"""
+    try:
+        # Delete all messages first (cascade should handle this, but being explicit)
+        supabase_admin.table("chat_messages")\
+            .delete()\
+            .eq("session_id", session_id)\
+            .execute()
+
+        # Delete the session
+        result = supabase_admin.table("chat_sessions")\
+            .delete()\
+            .eq("id", session_id)\
+            .execute()
+
+        return {"success": True, "message": "Session deleted successfully"}
+
+    except Exception as e:
+        logger.error(f"Delete chat session error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

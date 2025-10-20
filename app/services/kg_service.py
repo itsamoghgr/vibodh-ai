@@ -402,6 +402,300 @@ Return empty arrays if nothing found. JSON only, no explanation."""
                 print(f"[KG STATS ERROR] {str(e)}")
             return {}
 
+    # ===== SCHEMA EVOLUTION METHODS (Phase 3, Step 4) =====
+
+    def propose_new_entity_types(self, org_id: str, days_back: int = 30) -> List[Dict[str, Any]]:
+        """
+        Analyze recent entities and propose new entity types.
+
+        Args:
+            org_id: Organization ID
+            days_back: Number of days to analyze
+
+        Returns:
+            List of proposed new entity types with justification
+        """
+        try:
+            from datetime import datetime, timedelta
+            cutoff_date = datetime.now() - timedelta(days=days_back)
+
+            # Current allowed types
+            current_types = ['person', 'project', 'topic', 'tool', 'issue', 'channel', 'document']
+
+            # Get recent entities
+            recent_entities = self.supabase.table('kg_entities')\
+                .select('name, type, metadata')\
+                .eq('org_id', org_id)\
+                .gte('created_at', cutoff_date.isoformat())\
+                .execute()
+
+            if not recent_entities.data or len(recent_entities.data) < 20:
+                return []
+
+            # Analyze with LLM to identify potential new types
+            entities_sample = recent_entities.data[:50]
+            entity_names = [e['name'] for e in entities_sample]
+
+            prompt = f"""Analyze these entity names from a knowledge graph and identify if new entity types should be added.
+
+Current entity types: {', '.join(current_types)}
+
+Recent entities:
+{chr(10).join(f"- {name}" for name in entity_names[:30])}
+
+Are there recurring patterns or categories of entities that don't fit well into existing types?
+If yes, propose up to 3 new entity types with:
+1. Type name (lowercase, singular)
+2. Description
+3. Example entities from the list that would fit this type
+
+Respond in JSON format:
+{{"proposals": [{{"type": "...", "description": "...", "examples": ["...", "..."]}}]}}
+
+If no new types needed, return: {{"proposals": []}}"""
+
+            response = self.llm_client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are an expert in knowledge graph schema design."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=500
+            )
+
+            import json
+            result_text = response.choices[0].message.content.strip()
+
+            # Extract JSON from response
+            if result_text.startswith('```json'):
+                result_text = result_text.split('```json')[1].split('```')[0].strip()
+            elif result_text.startswith('```'):
+                result_text = result_text.split('```')[1].split('```')[0].strip()
+
+            result = json.loads(result_text)
+            proposals = result.get('proposals', [])
+
+            # Store proposals in kg_schema_evolution table
+            for proposal in proposals:
+                self.supabase.table('kg_schema_evolution').insert({
+                    'org_id': org_id,
+                    'change_type': 'new_entity_type',
+                    'new_value': proposal['type'],
+                    'reason': proposal['description'],
+                    'status': 'proposed',
+                    'metadata': {
+                        'examples': proposal.get('examples', []),
+                        'analysis_date': datetime.now().isoformat()
+                    }
+                }).execute()
+
+            if DEBUG and proposals:
+                print(f"[KG EVOLUTION] Proposed {len(proposals)} new entity types")
+
+            return proposals
+
+        except Exception as e:
+            if DEBUG:
+                print(f"[KG EVOLUTION ERROR] Failed to propose entity types: {str(e)}")
+            return []
+
+    def propose_new_relation_types(self, org_id: str, days_back: int = 30) -> List[Dict[str, Any]]:
+        """
+        Analyze recent relationships and propose new relation types.
+
+        Args:
+            org_id: Organization ID
+            days_back: Number of days to analyze
+
+        Returns:
+            List of proposed new relation types
+        """
+        try:
+            from datetime import datetime, timedelta
+            cutoff_date = datetime.now() - timedelta(days=days_back)
+
+            # Get recent edges
+            recent_edges = self.supabase.table('kg_edges')\
+                .select('relation, metadata')\
+                .eq('org_id', org_id)\
+                .gte('created_at', cutoff_date.isoformat())\
+                .execute()
+
+            if not recent_edges.data or len(recent_edges.data) < 10:
+                return []
+
+            # Get unique relation types
+            relations = {}
+            for edge in recent_edges.data:
+                rel = edge['relation']
+                relations[rel] = relations.get(rel, 0) + 1
+
+            # Get distinct relation types and their counts
+            relation_summary = sorted(
+                [(rel, count) for rel, count in relations.items()],
+                key=lambda x: x[1],
+                reverse=True
+            )[:20]
+
+            prompt = f"""Analyze these relationship types from a knowledge graph and identify if new, more specific relation types should be added.
+
+Current relations (with frequency):
+{chr(10).join(f"- {rel}: {count} occurrences" for rel, count in relation_summary)}
+
+Are there patterns suggesting we need more specific or additional relationship types?
+Propose up to 3 new relation types with:
+1. Relation name (lowercase, verb-like)
+2. Description
+3. How it differs from existing relations
+
+Respond in JSON format:
+{{"proposals": [{{"relation": "...", "description": "...", "use_case": "..."}}]}}
+
+If no new relations needed, return: {{"proposals": []}}"""
+
+            response = self.llm_client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are an expert in knowledge graph schema design."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=400
+            )
+
+            import json
+            result_text = response.choices[0].message.content.strip()
+
+            # Extract JSON from response
+            if result_text.startswith('```json'):
+                result_text = result_text.split('```json')[1].split('```')[0].strip()
+            elif result_text.startswith('```'):
+                result_text = result_text.split('```')[1].split('```')[0].strip()
+
+            result = json.loads(result_text)
+            proposals = result.get('proposals', [])
+
+            # Store proposals
+            for proposal in proposals:
+                self.supabase.table('kg_schema_evolution').insert({
+                    'org_id': org_id,
+                    'change_type': 'new_relation_type',
+                    'new_value': proposal['relation'],
+                    'reason': proposal['description'],
+                    'status': 'proposed',
+                    'metadata': {
+                        'use_case': proposal.get('use_case', ''),
+                        'analysis_date': datetime.now().isoformat()
+                    }
+                }).execute()
+
+            if DEBUG and proposals:
+                print(f"[KG EVOLUTION] Proposed {len(proposals)} new relation types")
+
+            return proposals
+
+        except Exception as e:
+            if DEBUG:
+                print(f"[KG EVOLUTION ERROR] Failed to propose relation types: {str(e)}")
+            return []
+
+    def apply_schema_evolution(
+        self,
+        org_id: str,
+        evolution_id: str,
+        approved_by: Optional[str] = None
+    ) -> bool:
+        """
+        Apply an approved schema evolution change.
+
+        Args:
+            org_id: Organization ID
+            evolution_id: Schema evolution record ID
+            approved_by: User ID who approved the change
+
+        Returns:
+            True if successful
+        """
+        try:
+            from datetime import datetime
+
+            # Get the evolution record
+            evolution = self.supabase.table('kg_schema_evolution')\
+                .select('*')\
+                .eq('id', evolution_id)\
+                .eq('org_id', org_id)\
+                .single()\
+                .execute()
+
+            if not evolution.data:
+                if DEBUG:
+                    print(f"[KG EVOLUTION] Evolution {evolution_id} not found")
+                return False
+
+            change = evolution.data
+
+            # Update status to applied
+            self.supabase.table('kg_schema_evolution')\
+                .update({
+                    'status': 'applied',
+                    'reviewed_by': approved_by,
+                    'reviewed_at': datetime.now().isoformat(),
+                    'applied_at': datetime.now().isoformat()
+                })\
+                .eq('id', evolution_id)\
+                .execute()
+
+            if DEBUG:
+                print(f"[KG EVOLUTION] Applied schema evolution: {change['change_type']} - {change['new_value']}")
+
+            return True
+
+        except Exception as e:
+            if DEBUG:
+                print(f"[KG EVOLUTION ERROR] Failed to apply schema evolution: {str(e)}")
+            return False
+
+    def get_schema_version(self, org_id: str) -> Dict[str, Any]:
+        """
+        Get current KG schema version and composition.
+
+        Args:
+            org_id: Organization ID
+
+        Returns:
+            Schema version information
+        """
+        try:
+            result = self.supabase.rpc(
+                'get_kg_schema_version',
+                {'org_uuid': org_id}
+            ).execute()
+
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+
+            return {
+                'version': 1,
+                'entity_types': [],
+                'relation_types': [],
+                'total_entities': 0,
+                'total_relations': 0,
+                'last_evolution_at': None
+            }
+
+        except Exception as e:
+            if DEBUG:
+                print(f"[KG SCHEMA VERSION ERROR] {str(e)}")
+            return {
+                'version': 1,
+                'entity_types': [],
+                'relation_types': [],
+                'total_entities': 0,
+                'total_relations': 0,
+                'last_evolution_at': None
+            }
+
 
 def get_kg_service(supabase_client: Client) -> KGService:
     """Get KG service instance"""
