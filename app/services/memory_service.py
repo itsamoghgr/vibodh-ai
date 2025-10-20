@@ -121,8 +121,7 @@ class MemoryService:
             logger.info(f"Retrieving memories for query: {query[:50]}...")
 
             # Generate query embedding
-            query_embeddings = await self.embedding_service.generate_embeddings([query])
-            query_embedding = query_embeddings[0] if query_embeddings else None
+            query_embedding = self.embedding_service.generate_embedding(query)
 
             if not query_embedding:
                 logger.warning("Failed to generate query embedding")

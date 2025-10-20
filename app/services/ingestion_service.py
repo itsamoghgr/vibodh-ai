@@ -7,7 +7,6 @@ Handles data ingestion from various sources and triggers embedding generation
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from supabase import Client
-from connectors.slack_connector import get_slack_connector
 from app.services.embedding_service import get_embedding_service
 
 
@@ -15,8 +14,17 @@ class IngestionService:
     def __init__(self, supabase_client: Client):
         """Initialize ingestion service"""
         self.supabase = supabase_client
-        self.slack = get_slack_connector()
+        # Slack connector will be injected when needed to avoid circular imports
+        self._slack = None
         self.embedding_service = get_embedding_service()
+
+    @property
+    def slack(self):
+        """Lazy load slack connector to avoid circular imports"""
+        if self._slack is None:
+            from app.connectors.slack_connector import SlackConnector
+            self._slack = SlackConnector(self.supabase)
+        return self._slack
 
     async def ingest_slack(
         self,
@@ -434,6 +442,46 @@ class IngestionService:
         print(f"[INGEST] DEBUG: Returning top {min(len(similarities), limit)} results")
         return similarities[:limit]
 
+
+    async def ingest_document(self, document: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Ingest a single document (for ClickUp, files, etc.)
+
+        Args:
+            document: Document dict with org_id, content, metadata, etc.
+
+        Returns:
+            Ingested document with ID
+        """
+        try:
+            org_id = document.get("org_id")
+            content = document.get("content")
+
+            if not org_id or not content:
+                raise ValueError("Document must have org_id and content")
+
+            # Insert or update document
+            result = self.supabase.table("documents").upsert(document).execute()
+
+            if not result.data:
+                raise Exception("Failed to insert document")
+
+            doc = result.data[0]
+            document_id = doc["id"]
+
+            # Generate embeddings
+            await self._generate_embeddings(
+                document_id=document_id,
+                content=content,
+                org_id=org_id,
+                metadata=document.get("metadata", {})
+            )
+
+            return doc
+
+        except Exception as e:
+            logger.error(f"Error ingesting document: {e}", exc_info=True)
+            raise
 
     async def handle_slack_event(
         self,

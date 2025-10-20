@@ -18,6 +18,11 @@ from app.services.memory_service import get_memory_service
 from app.services.feedback_service import get_feedback_service
 from app.services.adaptive_engine import get_adaptive_engine
 from app.services.meta_learning_service import get_meta_learning_service
+from app.services.agent_registry import get_agent_registry
+from app.services.action_planning_service import get_action_planning_service
+from app.services.safety_service import get_safety_service
+from app.agents.base_agent import ObservationContext
+from app.models.agent import TriggerType
 from app.core.config import settings
 from app.core.logging import logger as app_logger
 import requests
@@ -33,15 +38,44 @@ class OrchestratorService:
         self.feedback_service = get_feedback_service(supabase)
         self.adaptive_engine = get_adaptive_engine(supabase)
         self.meta_learning_service = get_meta_learning_service(supabase)
+        # Agent services (Phase 4)
+        self.agent_registry = get_agent_registry(supabase)
+        self.action_planning = get_action_planning_service(supabase)
+        self.safety_service = get_safety_service(supabase)
         self.groq_api_key = settings.GROQ_API_KEY
 
     def classify_intent(self, query: str) -> str:
         """
         Classify user query intent using keyword heuristics and LLM.
 
-        Returns: question | task | summary | insight | risk
+        Returns: question | task | summary | insight | risk | execute
         """
         query_lower = query.lower()
+
+        # Check for execution/action keywords (Phase 4 addition)
+        execution_keywords = [
+            "execute", "run", "launch", "start", "initiate", "perform",
+            "carry out", "implement", "deploy", "activate", "trigger",
+            "automate", "schedule", "send", "post", "publish", "update"
+        ]
+
+        # Check for approval/confirmation keywords (for plan approval)
+        approval_keywords = [
+            "yes", "approve", "confirm", "proceed", "go ahead",
+            "accept", "agreed", "ok", "okay", "sure", "do it"
+        ]
+        approval_context_keywords = ["plan", "action", "execution"]
+
+        # If query contains approval word + optional context word, treat as execution
+        if any(word in query_lower for word in approval_keywords):
+            # Check if there's context suggesting plan approval
+            has_approval_context = any(ctx in query_lower for ctx in approval_context_keywords)
+            if has_approval_context or len(query.strip().split()) <= 3:
+                # Short affirmative response or explicit plan approval
+                return "execute"
+
+        if any(word in query_lower for word in execution_keywords):
+            return "execute"
 
         # Keyword-based heuristics
         if any(word in query_lower for word in ["summarize", "summary", "overview", "recap"]):
@@ -54,6 +88,9 @@ class OrchestratorService:
             return "insight"
 
         if any(word in query_lower for word in ["create", "make", "build", "generate", "do", "task"]):
+            # Check if it's about executing vs just planning
+            if any(exec_word in query_lower for exec_word in execution_keywords):
+                return "execute"
             return "task"
 
         # Default to question
@@ -62,7 +99,10 @@ class OrchestratorService:
 
         # Use LLM for complex cases
         try:
-            prompt = f"""Classify the following query into one category: question, task, summary, insight, or risk.
+            prompt = f"""Classify the following query into one category: question, task, summary, insight, risk, or execute.
+
+'execute' means the user wants to take action or automate something.
+'task' means the user is asking about how to do something but not necessarily do it now.
 
 Query: "{query}"
 
@@ -84,7 +124,7 @@ Respond with ONLY the category name, nothing else."""
 
             if response.status_code == 200:
                 intent = response.json()["choices"][0]["message"]["content"].strip().lower()
-                if intent in ["question", "task", "summary", "insight", "risk"]:
+                if intent in ["question", "task", "summary", "insight", "risk", "execute"]:
                     return intent
         except Exception as e:
             print(f"[ORCHESTRATOR] LLM intent classification failed: {e}")
@@ -177,6 +217,337 @@ Respond with ONLY the category name, nothing else."""
         refined_modules = self.apply_meta_rules(query, intent, org_id, base_modules)
 
         return refined_modules
+
+    async def delegate_to_agent(
+        self,
+        query: str,
+        org_id: str,
+        user_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Delegate execution task to appropriate agent.
+        Phase 4 addition for autonomous execution.
+
+        Args:
+            query: User query requesting action
+            org_id: Organization ID
+            user_id: User ID
+            context: Additional context
+
+        Returns:
+            Agent execution result
+        """
+        try:
+            app_logger.info(f"[ORCHESTRATOR] Delegating to agent: {query[:50]}...")
+
+            # FIRST: Check if this is a plan approval request
+            query_lower = query.lower().strip()
+            approval_keywords = [
+                "yes", "approve", "confirm", "proceed", "go ahead",
+                "accept", "agreed", "ok", "okay", "sure", "do it"
+            ]
+
+            is_approval = any(keyword == query_lower or keyword in query_lower.split() for keyword in approval_keywords)
+
+            if is_approval:
+                app_logger.info(f"[ORCHESTRATOR] Detected approval keyword in query: '{query}'")
+
+                # Check for pending plans requiring approval
+                # Try both "pending" and "pending_approval" statuses
+                pending_plans = self.supabase.table("ai_action_plans")\
+                    .select("*")\
+                    .eq("org_id", org_id)\
+                    .in_("status", ["pending", "pending_approval"])\
+                    .order("created_at", desc=True)\
+                    .limit(1)\
+                    .execute()
+
+                if pending_plans.data:
+                    plan = pending_plans.data[0]
+                    app_logger.info(f"[ORCHESTRATOR] Found pending plan {plan['id']} with status='{plan['status']}' - approving and executing")
+
+                    # Approve and execute the plan
+                    return await self._approve_and_execute_plan(plan, org_id, user_id)
+                else:
+                    app_logger.warning(f"[ORCHESTRATOR] No pending plans found for org {org_id} to approve")
+
+            # No pending plan to approve, continue with normal flow
+            # Route to appropriate agent
+            agent_type = await self.agent_registry.route_to_agent(org_id, query, context or {})
+
+            if not agent_type:
+                return {
+                    "success": False,
+                    "error": "No suitable agent found for this request",
+                    "suggestion": "Try rephrasing your request or check available agents"
+                }
+
+            # Get agent instance
+            try:
+                agent = self.agent_registry.get_agent(org_id, agent_type)
+            except ValueError as e:
+                app_logger.warning(f"[ORCHESTRATOR] Agent not available: {e}")
+                return {
+                    "success": False,
+                    "error": f"Agent '{agent_type}' is not available",
+                    "suggestion": "The requested agent type is not currently registered"
+                }
+
+            # Create observation context
+            obs_context = ObservationContext(
+                query=query,
+                trigger_type="orchestrator",
+                org_id=org_id,
+                user_id=user_id,
+                metadata=context or {}
+            )
+
+            # Check if agent thinks action is needed
+            should_act, reason = await agent.observe(obs_context)
+
+            if not should_act:
+                return {
+                    "success": True,
+                    "action_needed": False,
+                    "reason": reason or "No action required for this request",
+                    "agent_type": agent_type
+                }
+
+            # Generate action plan
+            plan = await agent.plan(query, context or {})
+
+            # Validate plan with safety service
+            is_valid, risk_level, issues = await self.safety_service.validate_plan(plan, org_id)
+
+            if not is_valid:
+                return {
+                    "success": False,
+                    "error": "Action plan validation failed",
+                    "validation_issues": issues,
+                    "agent_type": agent_type
+                }
+
+            # Create action plan in database
+            plan_response = await self.action_planning.create_action_plan(
+                org_id=org_id,
+                plan=plan,
+                agent_type=agent_type,
+                trigger_type=TriggerType.ORCHESTRATOR,
+                trigger_source={"query": query},
+                user_id=user_id
+            )
+
+            # Prepare response based on approval requirements
+            if plan.requires_approval:
+                return {
+                    "success": True,
+                    "plan_created": True,
+                    "plan_id": str(plan_response.id),
+                    "requires_approval": True,
+                    "risk_level": risk_level.value,
+                    "goal": plan.goal,
+                    "total_steps": plan.total_steps,
+                    "agent_type": agent_type,
+                    "message": f"Action plan created but requires approval due to {risk_level.value} risk level",
+                    "next_action": "Review and approve the plan in the dashboard"
+                }
+            else:
+                # Auto-execute low-risk actions
+                app_logger.info(f"[ORCHESTRATOR] Auto-executing plan {plan_response.id} (low risk)")
+
+                # Update plan status to approved
+                self.supabase.table("ai_action_plans")\
+                    .update({
+                        "status": "approved",
+                        "approval_status": "approved",
+                        "approved_by": user_id,
+                        "approved_at": datetime.utcnow().isoformat()
+                    })\
+                    .eq("id", str(plan_response.id))\
+                    .execute()
+
+                # Execute each step
+                executed_steps = []
+                for step in plan.steps:
+                    app_logger.info(f"[ORCHESTRATOR] Executing step {step.step_index + 1}/{plan.total_steps}: {step.action_name}")
+
+                    # Execute the step
+                    result = await agent.execute(step)
+
+                    executed_steps.append({
+                        "step_index": step.step_index,
+                        "action_name": step.action_name,
+                        "success": result.success,
+                        "result": result.result if result.success else None,
+                        "error": result.error_message if not result.success else None
+                    })
+
+                    # If step failed, stop execution
+                    if not result.success:
+                        app_logger.error(f"[ORCHESTRATOR] Step {step.step_index} failed: {result.error_message}")
+                        # Update plan status to failed
+                        self.supabase.table("ai_action_plans")\
+                            .update({"status": "failed"})\
+                            .eq("id", str(plan_response.id))\
+                            .execute()
+
+                        return {
+                            "success": False,
+                            "plan_created": True,
+                            "plan_id": str(plan_response.id),
+                            "executed_steps": executed_steps,
+                            "error": f"Step {step.step_index + 1} failed: {result.error_message}",
+                            "agent_type": agent_type
+                        }
+
+                # All steps succeeded - mark plan as completed
+                self.supabase.table("ai_action_plans")\
+                    .update({
+                        "status": "completed",
+                        "completed_steps": plan.total_steps,
+                        "completed_at": datetime.utcnow().isoformat()
+                    })\
+                    .eq("id", str(plan_response.id))\
+                    .execute()
+
+                app_logger.info(f"[ORCHESTRATOR] Plan {plan_response.id} completed successfully")
+
+                return {
+                    "success": True,
+                    "plan_created": True,
+                    "plan_id": str(plan_response.id),
+                    "requires_approval": False,
+                    "risk_level": risk_level.value,
+                    "goal": plan.goal,
+                    "total_steps": plan.total_steps,
+                    "executed_steps": executed_steps,
+                    "agent_type": agent_type,
+                    "message": f"Action plan executed successfully. Completed {len(executed_steps)} steps.",
+                    "next_action": "View execution results"
+                }
+
+        except Exception as e:
+            app_logger.error(f"[ORCHESTRATOR] Agent delegation failed: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to delegate to agent: {str(e)}"
+            }
+
+    async def _approve_and_execute_plan(
+        self,
+        plan_data: Dict[str, Any],
+        org_id: str,
+        user_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Approve a pending plan and execute its steps.
+
+        Args:
+            plan_data: Plan data from database
+            org_id: Organization ID
+            user_id: User ID who approved
+
+        Returns:
+            Execution result
+        """
+        try:
+            plan_id = plan_data["id"]
+            agent_type = plan_data["agent_type"]
+            steps = plan_data["steps"]
+
+            app_logger.info(f"[ORCHESTRATOR] Approving plan {plan_id} with {len(steps)} steps")
+
+            # Update plan status to approved
+            self.supabase.table("ai_action_plans")\
+                .update({
+                    "status": "approved",
+                    "approval_status": "approved",
+                    "approved_by": user_id,
+                    "approved_at": datetime.utcnow().isoformat()
+                })\
+                .eq("id", plan_id)\
+                .execute()
+
+            # Get the agent to execute the steps
+            agent = self.agent_registry.get_agent(org_id, agent_type)
+
+            # Execute each step
+            executed_steps = []
+            for step_data in steps:
+                # Reconstruct ActionStep from JSON
+                from app.agents.base_agent import ActionStep
+                step = ActionStep(
+                    step_index=step_data["step_index"],
+                    action_type=step_data["action_type"],
+                    action_name=step_data["action_name"],
+                    description=step_data["description"],
+                    target_integration=step_data.get("target_integration"),
+                    target_resource=step_data.get("target_resource", {}),
+                    parameters=step_data.get("parameters", {}),
+                    risk_level=step_data.get("risk_level", "low"),
+                    requires_approval=step_data.get("requires_approval", False),
+                    depends_on=step_data.get("depends_on", []),
+                    estimated_duration_ms=step_data.get("estimated_duration_ms", 1000)
+                )
+
+                app_logger.info(f"[ORCHESTRATOR] Executing step {step.step_index + 1}/{len(steps)}: {step.action_name}")
+
+                # Execute the step
+                result = await agent.execute(step)
+
+                executed_steps.append({
+                    "step_index": step.step_index,
+                    "action_name": step.action_name,
+                    "success": result.success,
+                    "result": result.result if result.success else None,
+                    "error": result.error_message if not result.success else None
+                })
+
+                # If step failed and it's critical, stop execution
+                if not result.success:
+                    app_logger.error(f"[ORCHESTRATOR] Step {step.step_index} failed: {result.error_message}")
+                    # Update plan status to failed
+                    self.supabase.table("ai_action_plans")\
+                        .update({"status": "failed"})\
+                        .eq("id", plan_id)\
+                        .execute()
+
+                    return {
+                        "success": False,
+                        "plan_id": plan_id,
+                        "executed_steps": executed_steps,
+                        "error": f"Step {step.step_index + 1} failed: {result.error_message}"
+                    }
+
+            # All steps succeeded - mark plan as completed
+            self.supabase.table("ai_action_plans")\
+                .update({
+                    "status": "completed",
+                    "completed_steps": len(steps),
+                    "completed_at": datetime.utcnow().isoformat()
+                })\
+                .eq("id", plan_id)\
+                .execute()
+
+            app_logger.info(f"[ORCHESTRATOR] Plan {plan_id} completed successfully")
+
+            return {
+                "success": True,
+                "plan_id": plan_id,
+                "plan_approved": True,
+                "executed_steps": executed_steps,
+                "total_steps": len(steps),
+                "message": f"Plan approved and executed successfully. Completed {len(steps)} steps.",
+                "goal": plan_data.get("goal", "Unknown goal")
+            }
+
+        except Exception as e:
+            app_logger.error(f"[ORCHESTRATOR] Failed to approve/execute plan: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to approve and execute plan: {str(e)}"
+            }
 
     def execute_rag(self, query: str, org_id: str) -> Dict[str, Any]:
         """Execute RAG search and return results."""
@@ -453,6 +824,71 @@ Provide a clear, well-structured response."""
         # Step 1: Classify intent
         intent = self.classify_intent(query)
         print(f"[ORCHESTRATOR] Classified intent: {intent}")
+
+        # Step 1b: Check for execution intent (Phase 4)
+        if intent == "execute":
+            print(f"[ORCHESTRATOR] Execution intent detected, delegating to agent")
+
+            agent_result = await self.delegate_to_agent(
+                query=query,
+                org_id=org_id,
+                user_id=user_id,
+                context={"memories": memories} if memories else {}
+            )
+
+            # Format agent result as final answer
+            if agent_result.get("success"):
+                if agent_result.get("plan_created"):
+                    final_answer = f"I've created an action plan to: {agent_result.get('goal', 'complete your request')}\n\n"
+                    final_answer += f"Plan ID: {agent_result.get('plan_id')}\n"
+                    final_answer += f"Risk Level: {agent_result.get('risk_level', 'unknown')}\n"
+                    final_answer += f"Total Steps: {agent_result.get('total_steps', 0)}\n\n"
+
+                    if agent_result.get("requires_approval"):
+                        final_answer += "⚠️ This plan requires your approval before execution.\n"
+                        final_answer += "Please review the plan in the Agents dashboard."
+                    elif agent_result.get("executed_steps"):
+                        # Plan was auto-executed
+                        final_answer += "✅ Action completed successfully!\n\n"
+                        final_answer += "**Execution Summary:**\n"
+                        for step in agent_result.get("executed_steps", []):
+                            status_icon = "✅" if step["success"] else "❌"
+                            final_answer += f"{status_icon} {step['action_name']}\n"
+                            if not step["success"] and step.get("error"):
+                                final_answer += f"   Error: {step['error']}\n"
+                    else:
+                        final_answer += "✅ This plan has been queued for automatic execution.\n"
+                        final_answer += "You can monitor progress in the Agents dashboard."
+                else:
+                    final_answer = agent_result.get("reason", "No action was needed for your request.")
+            else:
+                final_answer = f"I couldn't create an action plan: {agent_result.get('error', 'Unknown error')}"
+                if agent_result.get("suggestion"):
+                    final_answer += f"\n\nSuggestion: {agent_result.get('suggestion')}"
+                if agent_result.get("validation_issues"):
+                    final_answer += f"\n\nValidation issues:\n" + "\n".join(f"- {issue}" for issue in agent_result["validation_issues"])
+
+            # Return early for agent execution
+            execution_time_ms = int((time.time() - start_time) * 1000)
+
+            return {
+                "intent": intent,
+                "modules_used": ["agent"],
+                "reasoning_steps": [
+                    {
+                        "step": "classify_intent",
+                        "result": "execute"
+                    },
+                    {
+                        "step": "delegate_to_agent",
+                        "result": agent_result
+                    }
+                ],
+                "final_answer": final_answer,
+                "context_sources": [],
+                "execution_time_ms": execution_time_ms,
+                "module_results": {"agent": agent_result}
+            }
 
         # Step 2: Route to modules
         modules_to_use = self.route_to_modules(query, intent, org_id)

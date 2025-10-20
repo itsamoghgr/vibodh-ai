@@ -15,12 +15,8 @@ from app.services.ingestion_service import get_ingestion_service
 from app.models.legacy_schemas import SlackIngestRequest
 
 # Import from root for legacy connectors
-import sys
-from pathlib import Path
-root_dir = str(Path(__file__).parent.parent.parent.parent)
-if root_dir not in sys.path:
-    sys.path.insert(0, root_dir)
-from connectors.slack_connector import get_slack_connector
+from app.connectors.slack_connector import SlackConnector
+from app.db import supabase
 
 router = APIRouter(prefix="/slack", tags=["Slack"])
 
@@ -32,7 +28,7 @@ async def start_slack_oauth(org_id: str = Query(...)):
     Redirects user to Slack authorization page
     """
     try:
-        slack_connector = get_slack_connector()
+        slack_connector = SlackConnector(supabase)
 
         # Generate state for CSRF protection
         state = f"{org_id}:{datetime.utcnow().timestamp()}"
@@ -53,7 +49,7 @@ async def slack_oauth_callback(code: str, state: str = None):
     Exchange code for access token and save connection
     """
     try:
-        slack_connector = get_slack_connector()
+        slack_connector = SlackConnector(supabase)
 
         # Extract org_id from state
         if not state:
@@ -154,13 +150,40 @@ async def slack_webhook(request: Request):
 
         # Handle event callbacks
         if body.get("type") == "event_callback":
-            # Process webhook event
             event = body.get("event", {})
-            logger.info(f"Slack event type: {event.get('type')}")
+            event_type = event.get("type")
+            team_id = body.get("team_id")
+
+            logger.info(f"Slack event type: {event_type} from team: {team_id}")
+
+            # Map team_id to org_id by looking up the connection
+            connection = supabase.table("connections")\
+                .select("org_id")\
+                .eq("source_type", "slack")\
+                .eq("workspace_id", team_id)\
+                .execute()
+
+            if not connection.data:
+                logger.warning(f"No connection found for Slack team {team_id}")
+                return {"ok": True}
+
+            org_id = connection.data[0]["org_id"]
+
+            # Process the event using SlackConnector
+            slack_connector = SlackConnector(supabase)
+
+            # Update the body with org_id for processing
+            body_with_org = {**body, "org_id": org_id}
+
+            await slack_connector.handle_webhook_event(body_with_org)
+
+            logger.info(f"Successfully processed Slack event for org {org_id}")
             return {"ok": True}
 
         return {"ok": True}
 
     except Exception as e:
         log_error(e, context="Slack webhook")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Don't raise exception - Slack will retry
+        logger.error(f"Error processing Slack webhook: {str(e)}")
+        return {"ok": False, "error": str(e)}

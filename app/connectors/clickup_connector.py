@@ -6,7 +6,6 @@ Abstraction layer for ClickUp integration
 from typing import Dict, Any, Optional
 from supabase import Client
 from app.services.clickup_service import ClickUpService
-from app.services.ingestion_service import get_ingestion_service
 from app.core.config import settings
 from app.core.logging import logger
 
@@ -16,8 +15,16 @@ class ClickUpConnector:
 
     def __init__(self, supabase: Client):
         self.supabase = supabase
-        self.clickup_service = ClickUpService(settings.CLICKUP_CLIENT_ID, settings.CLICKUP_CLIENT_SECRET)
-        self.ingestion_service = get_ingestion_service(supabase)
+        self.clickup_service = ClickUpService(supabase)
+        # Ingestion service will be injected when needed to avoid circular imports
+        self.ingestion_service = None
+
+    def _get_ingestion_service(self):
+        """Lazy load ingestion service to avoid circular imports"""
+        if self.ingestion_service is None:
+            from app.services.ingestion_service import get_ingestion_service
+            self.ingestion_service = get_ingestion_service(self.supabase)
+        return self.ingestion_service
 
     async def connect(self, code: str, org_id: str) -> Dict[str, Any]:
         """
@@ -122,7 +129,8 @@ class ClickUpConnector:
                                 doc_id = doc_result.data[0]["id"]
 
                                 # Generate embeddings
-                                await self.ingestion_service._generate_embeddings(
+                                ingestion_service = self._get_ingestion_service()
+                                await ingestion_service._generate_embeddings(
                                     document_id=doc_id,
                                     content=document["content"],
                                     org_id=org_id,

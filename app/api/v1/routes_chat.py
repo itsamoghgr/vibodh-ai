@@ -96,6 +96,10 @@ async def chat_stream(request: ChatStreamRequest):
             try:
                 logger.info(f"Chat stream: org_id={request.org_id}, user_id={request.user_id}, query={request.query[:50]}")
 
+                # Send thinking indicator
+                yield f"data: {json.dumps({'type': 'thinking'})}\n\n"
+                await asyncio.sleep(0.1)
+
                 result = await orchestrator.orchestrate_query(
                     query=request.query,
                     org_id=request.org_id,
@@ -110,6 +114,30 @@ async def chat_stream(request: ChatStreamRequest):
                 # Send context
                 if context_sources:
                     yield f"data: {json.dumps({'type': 'context', 'context': context_sources})}\n\n"
+
+                # Check if this is an agent result with an action plan
+                module_results = result.get('module_results', {})
+                agent_result = module_results.get('agent', {})
+
+                if agent_result.get('plan_created'):
+                    # Emit action_plan event with structured data
+                    action_plan_event = {
+                        'type': 'action_plan',
+                        'actionPlan': {
+                            'id': agent_result.get('plan_id'),
+                            'agentType': agent_result.get('agent_type', 'communication'),
+                            'goal': agent_result.get('goal', ''),
+                            'steps': [],  # Will be fetched from database if needed
+                            'riskLevel': agent_result.get('risk_level', 'low'),
+                            'requiresApproval': agent_result.get('requires_approval', False),
+                            'status': 'pending_approval' if agent_result.get('requires_approval') else 'approved',
+                            'totalSteps': agent_result.get('total_steps', 0),
+                            'completedSteps': len(agent_result.get('executed_steps', [])),
+                            'executedSteps': agent_result.get('executed_steps', [])
+                        }
+                    }
+                    yield f"data: {json.dumps(action_plan_event)}\n\n"
+                    await asyncio.sleep(0.1)
 
                 # Stream the response character by character for better UX
                 chunk_size = 5  # Stream 5 characters at a time
@@ -128,6 +156,21 @@ async def chat_stream(request: ChatStreamRequest):
                     # Only include context if there are items
                     if context_sources and len(context_sources) > 0:
                         assistant_message["context"] = context_sources
+
+                    # Store message type and action plan data in metadata JSONB field
+                    if agent_result.get('plan_created'):
+                        assistant_message["metadata"] = {
+                            "message_type": "action_plan",
+                            "plan_id": agent_result.get('plan_id'),
+                            "agent_type": agent_result.get('agent_type'),
+                            "goal": agent_result.get('goal'),
+                            "risk_level": agent_result.get('risk_level'),
+                            "total_steps": agent_result.get('total_steps'),
+                            "requires_approval": agent_result.get('requires_approval'),
+                            "executed_steps": agent_result.get('executed_steps', [])
+                        }
+                    else:
+                        assistant_message["metadata"] = {"message_type": "text"}
 
                     supabase.table("chat_messages").insert(assistant_message).execute()
 
@@ -149,7 +192,7 @@ async def chat_stream(request: ChatStreamRequest):
 
 @router.get("/history")
 async def get_chat_history(org_id: str, user_id: Optional[str] = None, limit: int = 10):
-    """Get chat session history"""
+    """Get chat session history with message counts"""
     try:
         query = supabase.table("chat_sessions")\
             .select("*")\
@@ -161,7 +204,20 @@ async def get_chat_history(org_id: str, user_id: Optional[str] = None, limit: in
             query = query.eq("user_id", user_id)
 
         result = query.execute()
-        return {"sessions": result.data}
+
+        # Add message count to each session
+        sessions_with_counts = []
+        for session in result.data:
+            # Get message count for this session
+            message_count_result = supabase.table("chat_messages")\
+                .select("id", count="exact")\
+                .eq("session_id", session["id"])\
+                .execute()
+
+            session["message_count"] = message_count_result.count or 0
+            sessions_with_counts.append(session)
+
+        return {"sessions": sessions_with_counts}
 
     except Exception as e:
         logger.error(f"Get chat history error: {e}")

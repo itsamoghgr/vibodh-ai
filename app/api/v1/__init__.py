@@ -16,6 +16,8 @@ from .routes_documents import router as documents_router
 from .routes_memory import router as memory_router
 from .routes_adaptive import router as adaptive_router
 from .routes_meta_learning import router as meta_learning_router
+from .routes_agents import router as agents_router
+from .routes_marketing import router as marketing_router
 
 # Create main v1 router
 api_v1_router = APIRouter(prefix="/api/v1")
@@ -33,5 +35,7 @@ api_v1_router.include_router(documents_router)
 api_v1_router.include_router(memory_router)
 api_v1_router.include_router(adaptive_router)
 api_v1_router.include_router(meta_learning_router)
+api_v1_router.include_router(agents_router)
+api_v1_router.include_router(marketing_router)
 
 __all__ = ["api_v1_router"]
