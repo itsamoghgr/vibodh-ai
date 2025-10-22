@@ -20,6 +20,9 @@ from .routes_agents import router as agents_router
 from .routes_marketing import router as marketing_router
 from .routes_approvals import router as approvals_router
 from .routes_analytics import router as analytics_router
+from .routes_cil import router as cil_router
+from .routes_ads import router as ads_router  # Phase 6
+from .routes_ads_alerts import router as ads_alerts_router  # Phase 6.5
 
 # Create main v1 router
 api_v1_router = APIRouter(prefix="/api/v1")
@@ -41,5 +44,8 @@ api_v1_router.include_router(agents_router)
 api_v1_router.include_router(marketing_router)
 api_v1_router.include_router(approvals_router)
 api_v1_router.include_router(analytics_router)
+api_v1_router.include_router(cil_router)
+api_v1_router.include_router(ads_router)  # Phase 6
+api_v1_router.include_router(ads_alerts_router)  # Phase 6.5
 
 __all__ = ["api_v1_router"]

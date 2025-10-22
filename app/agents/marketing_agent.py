@@ -229,6 +229,42 @@ class MarketingAgent(BaseAgent):
         """
         logger.info(f"[MARKETING_AGENT] Planning for goal: {goal}")
 
+        # Phase 6, Step 2: Query CIL proposals before planning
+        cil_suggestions = []
+        cil_auto_applied = []
+
+        org_id = self.config.get("org_id")
+        if org_id:
+            try:
+                proposals = await self._fetch_cil_proposals(org_id)
+
+                for proposal in proposals:
+                    # Auto-apply high-confidence proposals
+                    if proposal.get('confidence_score', 0) >= 0.8:
+                        applied = await self._apply_proposal(proposal)
+                        if applied:
+                            cil_auto_applied.append(proposal)
+                    else:
+                        # Add as suggestion for human review
+                        cil_suggestions.append(proposal)
+
+                if cil_auto_applied:
+                    logger.info(f"[MARKETING_AGENT] Auto-applied {len(cil_auto_applied)} high-confidence CIL proposals")
+                if cil_suggestions:
+                    logger.info(f"[MARKETING_AGENT] {len(cil_suggestions)} CIL proposals available for review")
+
+            except Exception as e:
+                logger.error(f"[MARKETING_AGENT] Failed to process CIL proposals: {e}", exc_info=True)
+
+        # Add CIL context to planning
+        if 'cil_suggestions' not in context:
+            context['cil_suggestions'] = []
+        context['cil_suggestions'].extend(cil_suggestions)
+
+        if 'cil_auto_applied' not in context:
+            context['cil_auto_applied'] = []
+        context['cil_auto_applied'].extend(cil_auto_applied)
+
         # Determine campaign type from goal
         campaign_type = self._determine_campaign_type(goal)
         template = self.campaign_templates.get(campaign_type, self.campaign_templates["product_launch"])
@@ -763,6 +799,7 @@ Format as JSON with keys: social_post, email_subject, cta"""
         - Content effectiveness
         - Engagement metrics
         - Areas for improvement
+        - Ad platform performance (Phase 6)
 
         Args:
             plan_id: Plan ID
@@ -793,11 +830,24 @@ Format as JSON with keys: social_post, email_subject, cta"""
             for r in successful_actions
         )
 
+        # Phase 6: Fetch ad platform performance metrics
+        ad_performance = await self._fetch_ad_platform_performance()
+
         # Generate lessons learned
         lessons = []
 
         if len(successful_actions) == len(results):
             lessons.append("All campaign actions executed successfully")
+
+        # Phase 6: Add lessons from ad platform performance
+        if ad_performance:
+            for platform, metrics in ad_performance.items():
+                if metrics.get("avg_ctr", 0) > 2.0:
+                    lessons.append(f"{platform}: Excellent CTR of {metrics['avg_ctr']:.2f}%")
+                if metrics.get("avg_roas", 0) > 3.0:
+                    lessons.append(f"{platform}: Strong ROAS of {metrics['avg_roas']:.2f}x")
+                if metrics.get("total_conversions", 0) > 50:
+                    lessons.append(f"{platform}: High conversion volume ({metrics['total_conversions']} conversions)")
 
         if failed_actions:
             lessons.append(f"{len(failed_actions)} actions failed and need review")
@@ -826,25 +876,51 @@ Format as JSON with keys: social_post, email_subject, cta"""
         if total_messages_sent == 0:
             improvements.append("Ensure announcement channels are configured")
 
+        # Phase 6: Add improvements from ad performance comparison
+        if ad_performance and len(ad_performance) > 1:
+            # Compare platforms
+            platforms_by_roas = sorted(
+                ad_performance.items(),
+                key=lambda x: x[1].get("avg_roas", 0),
+                reverse=True
+            )
+
+            if len(platforms_by_roas) >= 2:
+                best = platforms_by_roas[0]
+                worst = platforms_by_roas[-1]
+
+                if best[1].get("avg_roas", 0) > worst[1].get("avg_roas", 0) * 1.5:
+                    improvements.append(
+                        f"Consider shifting budget from {worst[0]} (ROAS: {worst[1].get('avg_roas', 0):.2f}x) "
+                        f"to {best[0]} (ROAS: {best[1].get('avg_roas', 0):.2f}x)"
+                    )
+
         improvements.append("Collect engagement metrics for next iteration")
         improvements.append("A/B test different message formats")
 
         # Determine if retry is needed
         should_retry = len(failed_actions) > 0 and len(failed_actions) < len(results) / 2
 
+        # Build performance metrics including ad platform data
+        performance_metrics = {
+            "total_actions": len(results),
+            "successful_actions": len(successful_actions),
+            "failed_actions": len(failed_actions),
+            "messages_sent": total_messages_sent,
+            "tasks_created": total_tasks_created,
+            "content_generated": content_generated
+        }
+
+        # Phase 6: Include ad platform performance in metrics
+        if ad_performance:
+            performance_metrics["ad_platforms"] = ad_performance
+
         reflection = ReflectionInsight(
             plan_id=plan_id,
             overall_success=len(failed_actions) == 0,
             lessons_learned=lessons,
             improvements_suggested=improvements,
-            performance_metrics={
-                "total_actions": len(results),
-                "successful_actions": len(successful_actions),
-                "failed_actions": len(failed_actions),
-                "messages_sent": total_messages_sent,
-                "tasks_created": total_tasks_created,
-                "content_generated": content_generated
-            },
+            performance_metrics=performance_metrics,
             should_retry=should_retry,
             retry_modifications={
                 "skip_failed_steps": True,
@@ -883,6 +959,294 @@ Format as JSON with keys: social_post, email_subject, cta"""
                 logger.error(f"[MARKETING_AGENT] Failed to publish campaign_completed event: {e}")
 
         return reflection
+
+    async def _fetch_cil_proposals(self, org_id: str) -> List[Dict[str, Any]]:
+        """
+        Fetch pending CIL ads optimization proposals.
+
+        Phase 6, Step 2: Query cil_policy_proposals table for ads-specific proposals
+        that haven't been applied yet.
+
+        Args:
+            org_id: Organization ID
+
+        Returns:
+            List of pending proposals
+        """
+        try:
+            from app.db import supabase
+
+            # Fetch pending ads optimization proposals
+            result = supabase.table('cil_policy_proposals')\
+                .select('*')\
+                .eq('org_id', org_id)\
+                .in_('proposal_type', [
+                    'budget_adjustment',
+                    'pause_campaign',
+                    'clone_campaign',
+                    'platform_shift',
+                    'increase_budget',
+                    'decrease_budget'
+                ])\
+                .eq('status', 'pending')\
+                .order('created_at', desc=False)\
+                .execute()
+
+            proposals = result.data or []
+
+            logger.debug(f"[MARKETING_AGENT] Found {len(proposals)} pending CIL ads proposals")
+
+            return proposals
+
+        except Exception as e:
+            logger.error(f"[MARKETING_AGENT] Failed to fetch CIL proposals: {e}", exc_info=True)
+            return []
+
+    async def _apply_proposal(self, proposal: Dict[str, Any]) -> bool:
+        """
+        Apply a CIL ads optimization proposal.
+
+        Phase 6, Step 2: Execute the optimization action (budget shift, pause, clone, etc.)
+        and record the outcome.
+
+        Args:
+            proposal: Proposal dictionary
+
+        Returns:
+            True if applied successfully, False otherwise
+        """
+        try:
+            from app.db import supabase
+            from datetime import datetime
+
+            proposal_id = proposal['id']
+            proposal_type = proposal['proposal_type']
+            ads_context = proposal.get('ads_context', {})
+
+            logger.info(
+                f"[MARKETING_AGENT] Applying CIL proposal: {proposal_type}",
+                extra={'proposal_id': proposal_id}
+            )
+
+            # Capture before metrics
+            metrics_before = {}
+
+            # Execute action based on proposal type
+            applied = False
+            action_taken = ""
+
+            if proposal_type == 'pause_campaign':
+                # Pause underperforming campaign
+                campaign_id = ads_context.get('campaign_id')
+                if campaign_id:
+                    # Get current metrics
+                    campaign = supabase.table('ad_campaigns')\
+                        .select('*')\
+                        .eq('id', campaign_id)\
+                        .single()\
+                        .execute()
+
+                    if campaign.data:
+                        metrics_before = {
+                            'status': campaign.data['status'],
+                            'campaign_name': campaign.data['name']
+                        }
+
+                        # Pause campaign
+                        supabase.table('ad_campaigns')\
+                            .update({'status': 'paused', 'updated_at': datetime.utcnow().isoformat()})\
+                            .eq('id', campaign_id)\
+                            .execute()
+
+                        action_taken = 'paused'
+                        applied = True
+                        logger.info(f"[MARKETING_AGENT] Paused campaign {campaign_id}")
+
+            elif proposal_type in ['increase_budget', 'decrease_budget']:
+                # Adjust campaign budget
+                campaign_id = ads_context.get('campaign_id')
+                adjustment_pct = ads_context.get('adjustment_percentage', 0)
+
+                if campaign_id and adjustment_pct:
+                    campaign = supabase.table('ad_campaigns')\
+                        .select('*')\
+                        .eq('id', campaign_id)\
+                        .single()\
+                        .execute()
+
+                    if campaign.data:
+                        old_budget = float(campaign.data.get('daily_budget', 0))
+                        new_budget = old_budget * (1 + adjustment_pct / 100.0)
+
+                        metrics_before = {
+                            'daily_budget': old_budget,
+                            'campaign_name': campaign.data['name']
+                        }
+
+                        # Update budget
+                        supabase.table('ad_campaigns')\
+                            .update({
+                                'daily_budget': new_budget,
+                                'updated_at': datetime.utcnow().isoformat()
+                            })\
+                            .eq('id', campaign_id)\
+                            .execute()
+
+                        action_taken = f'budget_{proposal_type.split("_")[0]}d'
+                        applied = True
+                        logger.info(
+                            f"[MARKETING_AGENT] Adjusted budget for campaign {campaign_id}: "
+                            f"${old_budget:.2f} → ${new_budget:.2f}"
+                        )
+
+            elif proposal_type == 'platform_shift':
+                # Record platform preference recommendation
+                from_platform = ads_context.get('from_platform')
+                to_platform = ads_context.get('to_platform')
+                performance_delta = ads_context.get('performance_delta', 0)
+
+                metrics_before = {
+                    'from_platform': from_platform,
+                    'to_platform': to_platform,
+                    'performance_delta': performance_delta
+                }
+
+                # Store recommendation in ai_meta_knowledge
+                supabase.table('ai_meta_knowledge').insert({
+                    'org_id': proposal['org_id'],
+                    'knowledge_type': 'platform_preference',
+                    'source_agent': 'marketing_agent',
+                    'insight_text': f"Shift budget from {from_platform} to {to_platform} (ROAS delta: {performance_delta:.2f}x)",
+                    'confidence_score': proposal.get('confidence_score', 0.8),
+                    'context': json.dumps({
+                        'from_platform': from_platform,
+                        'to_platform': to_platform,
+                        'performance_delta': performance_delta
+                    })
+                }).execute()
+
+                action_taken = 'platform_preference_recorded'
+                applied = True
+                logger.info(
+                    f"[MARKETING_AGENT] Recorded platform preference: {from_platform} → {to_platform}"
+                )
+
+            elif proposal_type == 'clone_campaign':
+                # Clone high-performing campaign
+                source_campaign_id = ads_context.get('campaign_id')
+
+                if source_campaign_id:
+                    source = supabase.table('ad_campaigns')\
+                        .select('*')\
+                        .eq('id', source_campaign_id)\
+                        .single()\
+                        .execute()
+
+                    if source.data:
+                        metrics_before = {
+                            'source_campaign_id': source_campaign_id,
+                            'source_campaign_name': source.data['name']
+                        }
+
+                        # Clone campaign (simplified - just log for now, actual cloning requires platform API)
+                        logger.info(
+                            f"[MARKETING_AGENT] Would clone campaign {source_campaign_id} ({source.data['name']})"
+                        )
+
+                        action_taken = 'clone_scheduled'
+                        applied = True
+
+            # Record proposal application in history
+            if applied:
+                # Update proposal status
+                supabase.table('cil_policy_proposals')\
+                    .update({
+                        'status': 'applied',
+                        'applied_at': datetime.utcnow().isoformat()
+                    })\
+                    .eq('id', proposal_id)\
+                    .execute()
+
+                # Create optimization history record
+                history_record = {
+                    'org_id': proposal['org_id'],
+                    'proposal_id': proposal_id,
+                    'proposal_type': proposal_type,
+                    'platform': ads_context.get('platform', 'unknown'),
+                    'campaign_id': ads_context.get('campaign_id'),
+                    'action_taken': action_taken,
+                    'metrics_before': json.dumps(metrics_before),
+                    'applied_at': datetime.utcnow().isoformat(),
+                    'expected_gain': proposal.get('expected_gain'),
+                    'confidence_score': proposal.get('confidence_score')
+                }
+
+                supabase.table('cil_ads_optimization_history').insert(history_record).execute()
+
+                logger.info(
+                    f"[MARKETING_AGENT] Successfully applied proposal {proposal_id}",
+                    extra={'proposal_type': proposal_type, 'action': action_taken}
+                )
+
+                return True
+
+            else:
+                logger.warning(
+                    f"[MARKETING_AGENT] Could not apply proposal {proposal_id} - insufficient context"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(
+                f"[MARKETING_AGENT] Failed to apply proposal {proposal.get('id')}: {e}",
+                exc_info=True
+            )
+            return False
+
+    async def _record_proposal_outcome(
+        self,
+        history_id: str,
+        success: bool,
+        actual_gain: Optional[float] = None,
+        feedback_notes: Optional[str] = None
+    ) -> None:
+        """
+        Record the outcome of an applied CIL proposal.
+
+        Phase 6, Step 2: Update optimization history with results after observation period.
+
+        Args:
+            history_id: Optimization history record ID
+            success: Whether the optimization improved performance
+            actual_gain: Actual performance improvement percentage
+            feedback_notes: Optional notes about the outcome
+        """
+        try:
+            from app.db import supabase
+            from datetime import datetime
+
+            update_data = {
+                'success': success,
+                'actual_gain': actual_gain,
+                'feedback_notes': feedback_notes,
+                'observation_end_date': datetime.utcnow().date().isoformat()
+            }
+
+            supabase.table('cil_ads_optimization_history')\
+                .update(update_data)\
+                .eq('id', history_id)\
+                .execute()
+
+            logger.info(
+                f"[MARKETING_AGENT] Recorded outcome for optimization {history_id}",
+                extra={'success': success, 'actual_gain': actual_gain}
+            )
+
+        except Exception as e:
+            logger.error(
+                f"[MARKETING_AGENT] Failed to record proposal outcome: {e}",
+                exc_info=True
+            )
 
     async def analyze_campaign_performance(
         self,
@@ -947,3 +1311,110 @@ Format as JSON with keys: social_post, email_subject, cta"""
         logger.info(f"[MARKETING_AGENT] Campaign {campaign_id} performance: {performance_score}")
 
         return analysis
+
+    async def _fetch_ad_platform_performance(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch recent ad platform performance metrics for reflection.
+
+        Phase 6: Queries ad_campaigns and ad_metrics tables to get
+        aggregated performance data from Google Ads and Meta Ads.
+
+        Returns:
+            Dictionary with platform performance metrics or None
+        """
+        try:
+            from app.db import supabase
+            from datetime import datetime, timedelta
+
+            org_id = self.config.get("org_id")
+            if not org_id:
+                return None
+
+            # Get active ad accounts
+            accounts = supabase.table("ad_accounts")\
+                .select("id, platform")\
+                .eq("org_id", org_id)\
+                .eq("status", "active")\
+                .execute()
+
+            if not accounts.data:
+                logger.debug(f"[MARKETING_AGENT] No active ad accounts for org {org_id}")
+                return None
+
+            # Calculate date range (last 30 days)
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=30)
+
+            platform_performance = {}
+
+            for account in accounts.data:
+                platform = account["platform"]
+
+                # Get campaigns for this account
+                campaigns = supabase.table("ad_campaigns")\
+                    .select("id")\
+                    .eq("account_id", account["id"])\
+                    .in_("status", ["active", "paused"])\
+                    .execute()
+
+                if not campaigns.data:
+                    continue
+
+                campaign_ids = [c["id"] for c in campaigns.data]
+
+                # Get metrics for these campaigns
+                metrics = supabase.table("ad_metrics")\
+                    .select("*")\
+                    .in_("campaign_id", campaign_ids)\
+                    .gte("metric_date", start_date.isoformat())\
+                    .lte("metric_date", end_date.isoformat())\
+                    .execute()
+
+                if metrics.data:
+                    # Aggregate metrics
+                    total_impressions = sum(m["impressions"] for m in metrics.data)
+                    total_clicks = sum(m["clicks"] for m in metrics.data)
+                    total_spend = sum(m["spend"] for m in metrics.data)
+                    total_conversions = sum(m.get("conversions", 0) for m in metrics.data)
+                    total_conv_value = sum(m.get("conversion_value", 0) or 0 for m in metrics.data)
+
+                    # Calculate averages
+                    avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
+                    avg_cpc = (total_spend / total_clicks) if total_clicks > 0 else 0
+                    avg_roas = (total_conv_value / total_spend) if total_spend > 0 else 0
+
+                    # Quality score / engagement rate (platform-specific)
+                    if platform == "google_ads":
+                        quality_scores = [m.get("quality_score") for m in metrics.data if m.get("quality_score")]
+                        avg_quality_score = sum(quality_scores) / len(quality_scores) if quality_scores else None
+                        special_metric = {"avg_quality_score": round(avg_quality_score, 1)} if avg_quality_score else {}
+                    else:  # meta_ads
+                        engagement_rates = [m.get("engagement_rate") for m in metrics.data if m.get("engagement_rate")]
+                        avg_engagement = sum(engagement_rates) / len(engagement_rates) if engagement_rates else None
+                        special_metric = {"avg_engagement_rate": round(avg_engagement, 2)} if avg_engagement else {}
+
+                    platform_performance[platform] = {
+                        "total_impressions": total_impressions,
+                        "total_clicks": total_clicks,
+                        "total_spend": round(total_spend, 2),
+                        "total_conversions": total_conversions,
+                        "avg_ctr": round(avg_ctr, 2),
+                        "avg_cpc": round(avg_cpc, 2),
+                        "avg_roas": round(avg_roas, 2),
+                        **special_metric,
+                        "campaigns_count": len(campaign_ids),
+                        "days_analyzed": 30
+                    }
+
+            if platform_performance:
+                logger.info(
+                    f"[MARKETING_AGENT] Fetched ad performance for {len(platform_performance)} platforms",
+                    extra={"org_id": org_id}
+                )
+                return platform_performance
+
+            return None
+
+        except Exception as e:
+            logger.error(f"[MARKETING_AGENT] Failed to fetch ad performance: {e}", exc_info=True)
+            return None

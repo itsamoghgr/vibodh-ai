@@ -46,6 +46,22 @@ class Settings(BaseSettings):
     CLICKUP_REDIRECT_URI: str
     CLICKUP_WEBHOOK_URL: Optional[str] = None
 
+    # Google Ads (Phase 6)
+    GOOGLE_ADS_CLIENT_ID: str = ""
+    GOOGLE_ADS_CLIENT_SECRET: str = ""
+    GOOGLE_ADS_DEVELOPER_TOKEN: str = ""  # Required for production Google Ads API
+    GOOGLE_ADS_REDIRECT_URI: str = ""
+
+    # Meta Ads (Phase 6)
+    META_ADS_APP_ID: str = ""
+    META_ADS_APP_SECRET: str = ""
+    META_ADS_REDIRECT_URI: str = ""
+
+    # Ads Integration Settings (Phase 6)
+    ADS_MOCK_MODE: bool = True  # Use synthetic data instead of real APIs
+    ADS_SYNC_INTERVAL_HOURS: int = 1  # How often to sync ad data
+    ADS_DEFAULT_LOOKBACK_DAYS: int = 90  # Default historical data window
+
     # SMTP Email
     SMTP_HOST: Optional[str] = ""
     SMTP_PORT: int = 587

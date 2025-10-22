@@ -13,6 +13,7 @@ from app.api.v1 import api_v1_router
 from app.db import supabase
 from app.services.agent_registry import get_agent_registry
 from app.agents import MarketingAgent, CommunicationAgent
+from app.workers import start_cil_worker, stop_cil_worker
 
 
 @asynccontextmanager
@@ -42,10 +43,36 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to register agents: {e}")
 
+    # Start CIL worker (Phase 5)
+    try:
+        import os
+        # Check if CIL is enabled via environment variable
+        cil_enabled = os.getenv("CIL_ENABLED", "true").lower() == "true"
+
+        if cil_enabled:
+            start_cil_worker(
+                learning_cycle_time=os.getenv("CIL_LEARNING_CYCLE_TIME", "2:00"),  # Default 2 AM UTC
+                telemetry_interval_minutes=int(os.getenv("CIL_TELEMETRY_INTERVAL_MINUTES", "5")),
+                proposal_check_interval_minutes=int(os.getenv("CIL_PROPOSAL_CHECK_INTERVAL_MINUTES", "15")),
+                enabled=True
+            )
+            logger.info("🧠 CIL worker started successfully")
+        else:
+            logger.info("CIL worker disabled via configuration")
+    except Exception as e:
+        logger.error(f"Failed to start CIL worker: {e}")
+
     yield
 
     # Shutdown
     logger.info(f"Shutting down {settings.APP_NAME}")
+
+    # Stop CIL worker
+    try:
+        stop_cil_worker()
+        logger.info("CIL worker stopped")
+    except Exception as e:
+        logger.error(f"Error stopping CIL worker: {e}")
 
 
 # Create FastAPI app
