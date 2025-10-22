@@ -18,6 +18,8 @@ from .routes_adaptive import router as adaptive_router
 from .routes_meta_learning import router as meta_learning_router
 from .routes_agents import router as agents_router
 from .routes_marketing import router as marketing_router
+from .routes_approvals import router as approvals_router
+from .routes_analytics import router as analytics_router
 
 # Create main v1 router
 api_v1_router = APIRouter(prefix="/api/v1")
@@ -37,5 +39,7 @@ api_v1_router.include_router(adaptive_router)
 api_v1_router.include_router(meta_learning_router)
 api_v1_router.include_router(agents_router)
 api_v1_router.include_router(marketing_router)
+api_v1_router.include_router(approvals_router)
+api_v1_router.include_router(analytics_router)
 
 __all__ = ["api_v1_router"]

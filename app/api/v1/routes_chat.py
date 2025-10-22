@@ -24,7 +24,7 @@ async def chat_stream(request: ChatStreamRequest):
     try:
         rag_service = get_rag_service(supabase)
 
-        # Create or get session
+        # Create or get session (use admin client to bypass RLS)
         session_id = request.session_id
         if not session_id and request.user_id:
             # Only create session if user_id is provided
@@ -33,13 +33,13 @@ async def chat_stream(request: ChatStreamRequest):
                 "user_id": request.user_id,
                 "title": request.query[:100]  # Use first 100 chars of query as title
             }
-            session = supabase.table("chat_sessions").insert(session_data).execute()
+            session = supabase_admin.table("chat_sessions").insert(session_data).execute()
             session_id = session.data[0]["id"]
 
         # Get conversation history (last 10 messages)
         conversation_history = []
         if session_id:
-            history_result = supabase.table("chat_messages")\
+            history_result = supabase_admin.table("chat_messages")\
                 .select("role, content")\
                 .eq("session_id", session_id)\
                 .order("created_at", desc=False)\
@@ -55,7 +55,7 @@ async def chat_stream(request: ChatStreamRequest):
                 "role": "user",
                 "content": request.query
             }
-            supabase.table("chat_messages").insert(user_message).execute()
+            supabase_admin.table("chat_messages").insert(user_message).execute()
 
         # Check if simple query
         simple_queries = ["hi", "hello", "hey", "thanks", "thank you", "bye", "goodbye", "ok", "okay"]
@@ -172,7 +172,7 @@ async def chat_stream(request: ChatStreamRequest):
                     else:
                         assistant_message["metadata"] = {"message_type": "text"}
 
-                    supabase.table("chat_messages").insert(assistant_message).execute()
+                    supabase_admin.table("chat_messages").insert(assistant_message).execute()
 
             except Exception as e:
                 logger.error(f"Orchestrator error: {e}", exc_info=True)
@@ -194,7 +194,8 @@ async def chat_stream(request: ChatStreamRequest):
 async def get_chat_history(org_id: str, user_id: Optional[str] = None, limit: int = 10):
     """Get chat session history with message counts"""
     try:
-        query = supabase.table("chat_sessions")\
+        # Use admin client to bypass RLS since this is a backend operation
+        query = supabase_admin.table("chat_sessions")\
             .select("*")\
             .eq("org_id", org_id)\
             .order("created_at", desc=True)\
@@ -209,7 +210,7 @@ async def get_chat_history(org_id: str, user_id: Optional[str] = None, limit: in
         sessions_with_counts = []
         for session in result.data:
             # Get message count for this session
-            message_count_result = supabase.table("chat_messages")\
+            message_count_result = supabase_admin.table("chat_messages")\
                 .select("id", count="exact")\
                 .eq("session_id", session["id"])\
                 .execute()
@@ -287,7 +288,7 @@ async def submit_feedback(feedback: FeedbackCreate):
             "rating": feedback.rating
         }
 
-        result = supabase.table("message_feedback").insert(feedback_data).execute()
+        result = supabase_admin.table("chat_feedback").insert(feedback_data).execute()
         return {"success": True, "data": result.data[0]}
 
     except Exception as e:

@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     CLICKUP_REDIRECT_URI: str
     CLICKUP_WEBHOOK_URL: Optional[str] = None
 
+    # SMTP Email
+    SMTP_HOST: Optional[str] = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: Optional[str] = ""
+    SMTP_PASSWORD: Optional[str] = ""
+    FROM_EMAIL: Optional[str] = ""
+    FROM_NAME: str = "Vibodh AI"
+    SMTP_USE_TLS: bool = True
+    SMTP_USE_SSL: bool = False
+
     # CORS
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8000"
 

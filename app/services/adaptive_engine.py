@@ -500,6 +500,157 @@ class AdaptiveEngine:
             logger.error(f"Error running full optimization: {e}", exc_info=True)
             return {"optimized": False, "error": str(e)}
 
+    async def ingest_pending_reflections(
+        self,
+        org_id: str,
+        limit: int = 50
+    ) -> Dict[str, Any]:
+        """
+        Ingest pending agent reflections and apply learning.
+
+        Args:
+            org_id: Organization ID
+            limit: Maximum number of reflections to process
+
+        Returns:
+            Ingestion results with actions taken
+        """
+        try:
+            logger.info(f"[ADAPTIVE_ENGINE] Ingesting pending reflections for org {org_id}")
+
+            # Fetch pending reflections
+            result = self.supabase.table("ai_reflections")\
+                .select("*")\
+                .eq("org_id", org_id)\
+                .eq("ingested_by_adaptive_engine", False)\
+                .order("created_at", desc=False)\
+                .limit(limit)\
+                .execute()
+
+            reflections = result.data if result.data else []
+
+            if not reflections:
+                logger.info("[ADAPTIVE_ENGINE] No pending reflections to ingest")
+                return {
+                    "reflections_processed": 0,
+                    "actions_taken": []
+                }
+
+            logger.info(f"[ADAPTIVE_ENGINE] Processing {len(reflections)} reflections")
+
+            actions_taken = []
+
+            for reflection in reflections:
+                reflection_actions = await self._process_reflection(reflection)
+                actions_taken.extend(reflection_actions)
+
+                # Mark reflection as ingested
+                self.supabase.table("ai_reflections")\
+                    .update({
+                        "ingested_by_adaptive_engine": True,
+                        "ingested_at": datetime.utcnow().isoformat(),
+                        "adaptive_actions_taken": reflection_actions,
+                        "updated_at": datetime.utcnow().isoformat()
+                    })\
+                    .eq("id", reflection["id"])\
+                    .execute()
+
+            logger.info(
+                f"[ADAPTIVE_ENGINE] Ingested {len(reflections)} reflections, "
+                f"took {len(actions_taken)} actions"
+            )
+
+            return {
+                "reflections_processed": len(reflections),
+                "actions_taken": actions_taken,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+        except Exception as e:
+            logger.error(f"[ADAPTIVE_ENGINE] Error ingesting reflections: {e}", exc_info=True)
+            return {
+                "reflections_processed": 0,
+                "actions_taken": [],
+                "error": str(e)
+            }
+
+    async def _process_reflection(
+        self,
+        reflection: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Process a single reflection and determine actions to take.
+
+        Args:
+            reflection: Reflection data
+
+        Returns:
+            List of actions taken
+        """
+        actions = []
+
+        try:
+            agent_type = reflection.get("agent_type")
+            overall_success = reflection.get("overall_success")
+            performance_metrics = reflection.get("performance_metrics", {})
+            learning_points = reflection.get("learning_points", [])
+            improvements_suggested = reflection.get("improvements_suggested", [])
+
+            # Action 1: Update agent success rate tracking
+            if overall_success is not None:
+                actions.append({
+                    "type": "success_rate_tracked",
+                    "agent_type": agent_type,
+                    "success": overall_success
+                })
+
+            # Action 2: Analyze performance metrics for optimization opportunities
+            if performance_metrics:
+                execution_time = performance_metrics.get("total_execution_time_ms", 0)
+                success_rate = performance_metrics.get("success_rate", 1.0)
+
+                # If success rate is low, consider adjusting parameters
+                if success_rate < 0.7:
+                    actions.append({
+                        "type": "low_success_rate_flagged",
+                        "agent_type": agent_type,
+                        "success_rate": success_rate,
+                        "recommendation": "Consider adjusting agent parameters or providing additional context"
+                    })
+
+                # If execution time is high, flag for optimization
+                if execution_time > 10000:  # > 10 seconds
+                    actions.append({
+                        "type": "high_execution_time_flagged",
+                        "agent_type": agent_type,
+                        "execution_time_ms": execution_time,
+                        "recommendation": "Consider optimizing action execution or parallelizing steps"
+                    })
+
+            # Action 3: Extract and store learning points
+            if learning_points:
+                for point in learning_points:
+                    actions.append({
+                        "type": "learning_point_extracted",
+                        "agent_type": agent_type,
+                        "learning_point": point
+                    })
+
+            # Action 4: Process improvement suggestions
+            if improvements_suggested:
+                for improvement in improvements_suggested:
+                    actions.append({
+                        "type": "improvement_suggested",
+                        "agent_type": agent_type,
+                        "suggestion": improvement
+                    })
+
+            return actions
+
+        except Exception as e:
+            logger.error(f"[ADAPTIVE_ENGINE] Error processing reflection: {e}", exc_info=True)
+            return []
+
     def get_optimization_history(
         self,
         org_id: str,

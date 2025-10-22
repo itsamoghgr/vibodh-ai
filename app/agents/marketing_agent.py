@@ -11,6 +11,7 @@ from app.agents.base_agent import (
 )
 from app.services.llm_service import get_llm_service
 from app.services.slack_service import SlackService
+from app.services.agent_event_bus import get_agent_event_bus, AgentEventType
 from app.core.config import settings
 from app.core.logging import logger
 import json
@@ -30,11 +31,13 @@ class MarketingAgent(BaseAgent):
 
     def _initialize_agent(self) -> None:
         """Initialize marketing-specific configuration and resources."""
+        from app.db import supabase
         self.llm_service = get_llm_service()
         self.slack_service = SlackService(
             settings.SLACK_CLIENT_ID,
             settings.SLACK_CLIENT_SECRET
         )
+        self.event_bus = get_agent_event_bus(supabase)
         self.campaign_templates = {
             "product_launch": {
                 "name": "Product Launch Campaign",
@@ -829,7 +832,7 @@ Format as JSON with keys: social_post, email_subject, cta"""
         # Determine if retry is needed
         should_retry = len(failed_actions) > 0 and len(failed_actions) < len(results) / 2
 
-        return ReflectionInsight(
+        reflection = ReflectionInsight(
             plan_id=plan_id,
             overall_success=len(failed_actions) == 0,
             lessons_learned=lessons,
@@ -848,6 +851,38 @@ Format as JSON with keys: social_post, email_subject, cta"""
                 "add_retries": True
             } if should_retry else None
         )
+
+        # Publish campaign_completed event if successful
+        if reflection.overall_success:
+            try:
+                # Get campaign details from context
+                campaign_summary = {
+                    "plan_id": plan_id,
+                    "success": True,
+                    "metrics": reflection.performance_metrics,
+                    "completed_at": datetime.utcnow().isoformat()
+                }
+
+                # Get org_id from self.config
+                org_id = self.config.get("org_id")
+                if org_id:
+                    self.event_bus.publish(
+                        org_id=org_id,
+                        event_type=AgentEventType.CAMPAIGN_COMPLETED,
+                        source_agent="marketing_agent",
+                        payload=campaign_summary,
+                        target_agent="communication_agent",  # Target CommunicationAgent for announcement
+                        priority="normal"
+                    )
+                    logger.info(
+                        f"[MARKETING_AGENT] Published campaign_completed event",
+                        extra={"plan_id": plan_id, "org_id": org_id}
+                    )
+            except Exception as e:
+                # Don't fail reflection if event publishing fails
+                logger.error(f"[MARKETING_AGENT] Failed to publish campaign_completed event: {e}")
+
+        return reflection
 
     async def analyze_campaign_performance(
         self,

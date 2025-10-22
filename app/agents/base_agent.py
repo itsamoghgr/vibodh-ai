@@ -431,6 +431,9 @@ class BaseAgent(ABC):
 
             logger.info(f"[{self.agent_type}] Reflection complete: {success_rate:.0%} success rate")
 
+            # Persist reflection to database for adaptive learning
+            await self._persist_reflection(plan_id, insights, results)
+
             self.state = AgentLifecycleState.IDLE
             return insights
 
@@ -452,6 +455,81 @@ class BaseAgent(ABC):
             Reflection insights
         """
         pass
+
+    async def _persist_reflection(
+        self,
+        plan_id: str,
+        insights: ReflectionInsight,
+        results: List[ExecutionResult]
+    ) -> None:
+        """
+        Persist reflection to database for adaptive learning.
+
+        Args:
+            plan_id: Plan ID
+            insights: Reflection insights
+            results: Execution results
+        """
+        try:
+            from app.db import supabase
+            import uuid
+
+            # Extract learning points from lessons_learned
+            learning_points = [
+                {"lesson": lesson, "category": "execution"}
+                for lesson in insights.lessons_learned
+            ]
+
+            # Create reflection record
+            reflection_data = {
+                "id": str(uuid.uuid4()),
+                "org_id": self.config.get("org_id"),
+                "agent_type": self.agent_type,
+                "plan_id": plan_id,
+                "reflection_type": "execution",
+                "trigger_event": "plan_completion",
+                "summary": f"Execution reflection for plan {plan_id}: {'Success' if insights.overall_success else 'Partial success'}",
+                "insights": insights.lessons_learned,
+                "patterns_discovered": [],  # Can be enhanced by agents
+                "improvements_suggested": insights.improvements_suggested,
+                "overall_success": insights.overall_success,
+                "confidence_score": None,  # Can be added by agents
+                "performance_metrics": insights.performance_metrics,
+                "learning_points": learning_points,
+                "preference_updates": [],  # Can be enhanced by agents
+                "context": {
+                    "results_count": len(results),
+                    "should_retry": insights.should_retry,
+                    "retry_modifications": insights.retry_modifications
+                },
+                "metadata": {
+                    "agent_type": self.agent_type,
+                    "plan_id": plan_id
+                },
+                "ingested_by_adaptive_engine": False,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }
+
+            # Insert reflection into database
+            supabase.table("ai_reflections")\
+                .insert(reflection_data)\
+                .execute()
+
+            logger.info(
+                f"[{self.agent_type}] Reflection persisted to database",
+                extra={
+                    "plan_id": plan_id,
+                    "overall_success": insights.overall_success
+                }
+            )
+
+        except Exception as e:
+            # Don't fail the reflection if persistence fails
+            logger.error(
+                f"[{self.agent_type}] Failed to persist reflection: {e}",
+                extra={"plan_id": plan_id}
+            )
 
     def get_status(self) -> Dict[str, Any]:
         """

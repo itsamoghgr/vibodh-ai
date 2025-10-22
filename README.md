@@ -85,6 +85,28 @@
 - **Embedding-Based Retrieval**: Semantic memory search
 - **Expiration Management**: Auto-expires low-importance memories
 
+### 🤖 **Phase 4: Autonomous Decision Agents** (Latest)
+- **OODA Loop**: Observe → Orient → Decide → Act cycle for all agent actions
+- **Multi-Agent System**: Communication, Research, and Analysis agents with specialized capabilities
+- **Agent Registry**: Centralized lifecycle management for all agents
+- **Event Bus**: Cross-agent coordination and knowledge sharing via ai_agent_events table
+- **Reflection System**: Post-execution learning stored in ai_reflections table
+- **Adaptive Learning**: Reflections feed into adaptive engine for continuous optimization
+
+### ✅ **Human-in-the-Loop Approvals** (Phase 4)
+- **Risk-Based Classification**: Actions categorized as low, medium, high, or critical risk
+- **Approval Dashboard**: Real-time UI for reviewing and approving/rejecting pending actions
+- **Auto-Approval Timeout**: Low-risk actions automatically approved after timeout period
+- **Approval Analytics**: Track approval rates, average approval times, and trends
+- **Audit Trail**: Complete history of all approval decisions with reasoning
+
+### 📊 **Observability & Analytics** (Phase 4)
+- **System Overview**: Real-time metrics for plans, approvals, agents, and integrations
+- **Agent Performance**: Success rates, execution times, and action counts per agent
+- **Integration Health**: Monitor status and response times of all external integrations
+- **Event Stream**: Real-time visualization of agent-to-agent events and coordination
+- **Analytics API**: Historical data analysis with customizable date ranges (1-365 days)
+
 ### 🏗️ **Architecture**
 
 #### Clean Modular Design
@@ -102,8 +124,10 @@
 - Repository pattern for database access
 
 ### 🔒 **Security & Configuration**
-- **Row Level Security**: Supabase RLS for data isolation
-- **Service Role Keys**: Admin operations with SERVICE_ROLE_KEY
+- **Row Level Security (RLS)**: Supabase RLS policies for data isolation
+- **RLS Bypass Pattern**: Backend uses supabase_admin (service role) to bypass RLS for multi-tenant operations
+- **Multi-Tenancy**: org_id passed as query parameter for organization-level data filtering
+- **Placeholder Auth**: Temporary auth module (app/core/auth.py) with TODOs for future JWT implementation
 - **Environment Variables**: Type-safe configuration with Pydantic
 - **CORS**: Configurable cross-origin resource sharing
 - **Structured Logging**: JSON-formatted logs with context
@@ -200,6 +224,24 @@
 - `GET /trends` - Get detected data trends
 - `GET /schema-version` - Get current KG schema version
 
+### Approvals (`/api/v1/approvals`) - Phase 4 NEW!
+- `GET /pending` - Get pending action approvals (org_id query param)
+- `GET /plans/{plan_id}` - Get approvals for specific plan
+- `POST /{action_id}/decide` - Approve or reject action (org_id query param)
+- `POST /bulk-decide` - Bulk approve/reject actions
+- `GET /stats` - Get approval statistics (org_id query param)
+- `GET /history` - Get approval history
+- `DELETE /{action_id}/expire` - Manually expire pending action
+
+### Analytics (`/api/v1/analytics`) - Phase 4 NEW!
+- `GET /overview` - System overview metrics (org_id query param)
+- `GET /agents/performance` - Agent performance metrics (org_id query param)
+- `GET /executions/timeline` - Execution timeline data
+- `GET /integrations/health` - Integration health summary (org_id query param)
+- `GET /reflections/insights` - Reflection insights
+- `GET /events/recent` - Recent agent events (org_id query param)
+- `GET /adaptive/learning-metrics` - Adaptive learning metrics
+
 ---
 
 ## Tech Stack
@@ -259,7 +301,8 @@ vibodh-ai/
 │   │   ├── memory_service.py
 │   │   ├── adaptive_engine.py
 │   │   ├── feedback_service.py
-│   │   └── meta_learning_service.py  # NEW!
+│   │   ├── meta_learning_service.py
+│   │   └── agent_registry.py           # Phase 4
 │   ├── connectors/             # Integration abstractions
 │   │   ├── slack_connector.py
 │   │   └── clickup_connector.py
@@ -276,7 +319,13 @@ vibodh-ai/
 │   │   ├── routes_rag.py
 │   │   ├── routes_memory.py
 │   │   ├── routes_adaptive.py
-│   │   └── routes_meta_learning.py  # NEW!
+│   │   ├── routes_meta_learning.py
+│   │   ├── routes_approvals.py         # Phase 4
+│   │   └── routes_analytics.py         # Phase 4
+│   ├── core/                   # Core modules
+│   │   ├── config.py
+│   │   ├── logging.py
+│   │   └── auth.py             # Placeholder auth (Phase 4)
 │   ├── utils/                  # Utilities
 │   └── tests/                  # Test suite
 │       ├── unit/

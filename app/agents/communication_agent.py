@@ -19,6 +19,8 @@ from app.agents.base_agent import (
 from app.services.slack_service import SlackService
 from app.services.communication_reasoning_service import get_communication_reasoning_service
 from app.services.communication_context_service import get_communication_context_service
+from app.services.agent_event_bus import get_agent_event_bus, AgentEventType
+from app.services.email_service import get_email_service, EmailMessage
 from app.core.config import settings
 from app.core.logging import logger
 from app.db import supabase
@@ -49,7 +51,24 @@ class CommunicationAgent(BaseAgent):
         self.reasoning_service = get_communication_reasoning_service(supabase)
         self.context_service = get_communication_context_service(supabase)
 
-        logger.info(f"[COMMUNICATION_AGENT] Initialized with reasoning and context services")
+        # Initialize agent event bus for cross-agent communication
+        self.event_bus = get_agent_event_bus(supabase)
+
+        # Initialize email service
+        self.email_service = get_email_service(supabase=supabase)
+
+        # Subscribe to relevant event types
+        self.event_bus.subscribe(
+            agent_type="communication_agent",
+            event_types=[
+                AgentEventType.CAMPAIGN_COMPLETED,
+                AgentEventType.TASK_CREATED,
+                AgentEventType.INSIGHT_GENERATED,
+                AgentEventType.WORKFLOW_COMPLETED
+            ]
+        )
+
+        logger.info(f"[COMMUNICATION_AGENT] Initialized with reasoning, context, event bus, and email")
 
     @property
     def capabilities(self) -> List[AgentCapability]:
@@ -97,7 +116,17 @@ class CommunicationAgent(BaseAgent):
         """
         logger.info(f"[COMMUNICATION_AGENT] Observing for communication opportunities")
 
-        # Path 1: Check for pending communication events (event-driven)
+        # Path 1a: Check for agent-to-agent events (cross-agent coordination)
+        agent_events = await self._check_agent_events()
+        if agent_events:
+            logger.info(
+                f"[COMMUNICATION_AGENT] Found {len(agent_events)} agent events"
+            )
+            # Store agent events in context for planning
+            context.metadata["agent_events"] = agent_events
+            return True, f"Cross-agent event: {len(agent_events)} agent events"
+
+        # Path 1b: Check for pending communication events (event-driven from listener)
         pending_events = await self._check_pending_communication_events()
         if pending_events:
             logger.info(
@@ -133,6 +162,33 @@ class CommunicationAgent(BaseAgent):
 
         logger.info(f"[COMMUNICATION_AGENT] No communication action needed")
         return False, None
+
+    async def _check_agent_events(self) -> List[Dict[str, Any]]:
+        """
+        Check for agent-to-agent events from the event bus.
+
+        Returns:
+            List of pending agent events targeted at communication_agent
+        """
+        try:
+            # Poll event bus for events targeted at this agent
+            events = self.event_bus.poll_events(
+                org_id=self.org_id,
+                agent_type="communication_agent",
+                event_types=[
+                    AgentEventType.CAMPAIGN_COMPLETED,
+                    AgentEventType.TASK_CREATED,
+                    AgentEventType.INSIGHT_GENERATED,
+                    AgentEventType.WORKFLOW_COMPLETED
+                ],
+                limit=5
+            )
+
+            return events
+
+        except Exception as e:
+            logger.error(f"[COMMUNICATION_AGENT] Failed to check agent events: {e}")
+            return []
 
     async def _check_pending_communication_events(self) -> List[Dict[str, Any]]:
         """
@@ -253,11 +309,12 @@ Now analyze this request:"""
         Generate intelligent communication action plan with reasoning.
 
         Enhanced planning process:
-        1. Analyze intent and urgency (reasoning service)
-        2. Gather rich context from KG + Memory
-        3. Log reasoning steps for transparency
-        4. Create context-aware action plan
-        5. Determine audience and channels intelligently
+        1. Check for agent events (cross-agent coordination)
+        2. Analyze intent and urgency (reasoning service)
+        3. Gather rich context from KG + Memory
+        4. Log reasoning steps for transparency
+        5. Create context-aware action plan
+        6. Determine audience and channels intelligently
 
         Args:
             goal: Communication goal
@@ -267,6 +324,12 @@ Now analyze this request:"""
             Context-aware action plan
         """
         logger.info(f"[COMMUNICATION_AGENT] Planning with reasoning for goal: {goal}")
+
+        # Step 0: Handle agent events if present (cross-agent coordination)
+        agent_events = context.get("agent_events", [])
+        if agent_events:
+            logger.info(f"[COMMUNICATION_AGENT] Handling {len(agent_events)} agent events")
+            return await self._plan_for_agent_event(agent_events[0], context)
 
         # Step 1: Analyze intent and get recommendations
         intent_analysis = await self.reasoning_service.analyze_communication_request(
@@ -538,6 +601,117 @@ Now analyze this request:"""
         else:
             return f"Informational message about '{topic}'"
 
+    async def _plan_for_agent_event(self, event: Dict[str, Any], context: Dict[str, Any]) -> ActionPlan:
+        """
+        Create action plan for handling agent-to-agent event.
+
+        Translates events from other agents into communication actions.
+        For example: campaign_completed → announce campaign success
+
+        Args:
+            event: Agent event from event bus
+            context: Planning context
+
+        Returns:
+            Action plan for communicating the event
+        """
+        event_type = event.get("event_type")
+        payload = event.get("payload", {})
+        source_agent = event.get("source_agent")
+
+        logger.info(
+            f"[COMMUNICATION_AGENT] Creating plan for {event_type} "
+            f"event from {source_agent}"
+        )
+
+        # Generate appropriate message based on event type
+        if event_type == AgentEventType.CAMPAIGN_COMPLETED.value:
+            metrics = payload.get("metrics", {})
+            channel = "#marketing"  # Default channel for marketing announcements
+            message = f"""🎉 *Marketing Campaign Completed Successfully!*
+
+Campaign ID: {payload.get('plan_id', 'N/A')}
+
+*Results:*
+• Total Actions: {metrics.get('total_actions', 0)}
+• Successful: {metrics.get('successful_actions', 0)}
+• Messages Sent: {metrics.get('messages_sent', 0)}
+• Tasks Created: {metrics.get('tasks_created', 0)}
+
+Great work team! 🚀"""
+
+        elif event_type == AgentEventType.TASK_CREATED.value:
+            channel = "#general"
+            message = f"""📋 *New Task Created*
+
+{payload.get('title', 'Task')}
+
+Check ClickUp for details!"""
+
+        elif event_type == AgentEventType.INSIGHT_GENERATED.value:
+            channel = "#insights"
+            message = f"""💡 *New Insight Available*
+
+{payload.get('summary', 'A new insight has been generated.')}"""
+
+        elif event_type == AgentEventType.WORKFLOW_COMPLETED.value:
+            channel = "#general"
+            message = f"""✅ *Workflow Completed*
+
+{payload.get('description', 'A workflow has finished successfully.')}"""
+
+        else:
+            # Generic handler
+            channel = "#general"
+            message = f"""ℹ️ *Agent Event: {event_type}*
+
+Event from: {source_agent}
+"""
+
+        # Create single-step plan for announcing the event
+        steps = [
+            ActionStep(
+                step_index=0,
+                action_type="send_message",
+                action_name=f"Announce {event_type}",
+                description=f"Announce {event_type} event from {source_agent}",
+                target_integration="slack",
+                target_resource={
+                    "type": "channel",
+                    "name": channel
+                },
+                parameters={
+                    "channel": channel,
+                    "message": message,
+                    "event_id": event.get("id"),
+                    "source_agent": source_agent
+                },
+                risk_level="low",
+                requires_approval=False,
+                depends_on=[],
+                estimated_duration_ms=1000
+            )
+        ]
+
+        plan = ActionPlan(
+            goal=f"Announce {event_type} event",
+            description=f"Cross-agent coordination: announce {event_type} from {source_agent}",
+            steps=steps,
+            total_steps=1,
+            risk_level="low",
+            requires_approval=False,
+            context={
+                "event_type": event_type,
+                "source_agent": source_agent,
+                "event_id": event.get("id"),
+                "payload": payload
+            },
+            confidence_score=0.9,  # High confidence for agent events
+            estimated_total_duration_ms=1000
+        )
+
+        return plan
+
     def _parse_message_request(self, goal: str) -> Tuple[str, str]:
         """
         Parse the goal to extract channel and message.
@@ -687,6 +861,20 @@ Now analyze this request:"""
                 # Step 3: Verification passed - send message
                 result_data = await self._send_slack_message(action)
 
+                # Step 4: Mark agent event as consumed (if this was triggered by an event)
+                event_id = action.parameters.get("event_id")
+                if event_id:
+                    try:
+                        source_agent = action.parameters.get("source_agent", "unknown")
+                        self.event_bus.mark_consumed(
+                            event_id=event_id,
+                            consumed_by="communication_agent",
+                            notes=f"Successfully announced event from {source_agent} to {channel}"
+                        )
+                        logger.info(f"[COMMUNICATION_AGENT] Marked event {event_id} as consumed")
+                    except Exception as e:
+                        logger.warning(f"[COMMUNICATION_AGENT] Failed to mark event as consumed: {e}")
+
                 return ExecutionResult(
                     success=True,
                     action_id=f"comm_{action.step_index}",
@@ -696,7 +884,8 @@ Now analyze this request:"""
                             "appropriate": verification.appropriate,
                             "confidence": verification.confidence,
                             "reason": verification.reason
-                        }
+                        },
+                        "event_consumed": event_id is not None
                     },
                     execution_time_ms=result_data.get("execution_time_ms", 1000),
                     side_effects=[{
@@ -919,35 +1108,59 @@ Now analyze this request:"""
         params = action.parameters
         subject = params.get("subject", "Communication Notification")
         recipients = params.get("recipients", [])
+        body_text = params.get("body", "")
+        priority = params.get("priority", "normal")
 
         logger.info(f"[COMMUNICATION_AGENT] Sending email backup to {len(recipients)} recipients")
 
         try:
-            # Log email to database for future email service integration
-            email_log = {
-                "org_id": self.org_id,
-                "email_type": "urgent_backup",
-                "subject": subject,
-                "body": params.get("body", ""),
-                "recipients": recipients,
-                "priority": params.get("priority", "normal"),
-                "status": "pending",
-                "created_at": datetime.now().isoformat()
-            }
+            # Create email message
+            email_message = EmailMessage(
+                to=recipients,
+                subject=subject,
+                body_text=body_text,
+                body_html=None  # Could add HTML template in future
+            )
 
-            supabase.table("email_queue").insert(email_log).execute()
+            # Send email via email service
+            result = self.email_service.send_email(
+                message=email_message,
+                org_id=self.org_id,
+                max_retries=3
+            )
 
             execution_time_ms = int((time.time() - start_time) * 1000)
 
-            logger.info(f"[COMMUNICATION_AGENT] Email backup queued for sending")
+            if result.get("success"):
+                logger.info(
+                    f"[COMMUNICATION_AGENT] Email backup sent successfully",
+                    extra={
+                        "recipients": recipients,
+                        "message_id": result.get("message_id")
+                    }
+                )
 
-            return {
-                "status": "queued",
-                "subject": subject,
-                "recipients": recipients,
-                "execution_time_ms": execution_time_ms,
-                "note": "Email queued for delivery via email service"
-            }
+                return {
+                    "status": "sent",
+                    "subject": subject,
+                    "recipients": recipients,
+                    "message_id": result.get("message_id"),
+                    "execution_time_ms": execution_time_ms,
+                    "sent_at": result.get("sent_at")
+                }
+            else:
+                logger.error(
+                    f"[COMMUNICATION_AGENT] Email backup failed after retries",
+                    extra={"error": result.get("error")}
+                )
+
+                return {
+                    "status": "failed",
+                    "subject": subject,
+                    "recipients": recipients,
+                    "error": result.get("error"),
+                    "execution_time_ms": execution_time_ms
+                }
 
         except Exception as e:
             logger.error(f"[COMMUNICATION_AGENT] Failed to send email backup: {e}")
