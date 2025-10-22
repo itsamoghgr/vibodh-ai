@@ -21,6 +21,7 @@ from app.services.meta_learning_service import get_meta_learning_service
 from app.services.agent_registry import get_agent_registry
 from app.services.action_planning_service import get_action_planning_service
 from app.services.safety_service import get_safety_service
+from app.services.cognitive_decision_engine import get_cognitive_decision_engine
 from app.agents.base_agent import ObservationContext
 from app.models.agent import TriggerType
 from app.core.config import settings
@@ -42,71 +43,200 @@ class OrchestratorService:
         self.agent_registry = get_agent_registry(supabase)
         self.action_planning = get_action_planning_service(supabase)
         self.safety_service = get_safety_service(supabase)
+        # Cognitive Decision Engine (Phase 4 Evolution)
+        self.cognitive_engine = get_cognitive_decision_engine(supabase)
         self.groq_api_key = settings.GROQ_API_KEY
 
-    def classify_intent(self, query: str) -> str:
+    async def classify_intent(
+        self,
+        query: str,
+        org_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> str:
         """
-        Classify user query intent using keyword heuristics and LLM.
+        Classify user query intent using Cognitive Decision Engine.
+
+        Now powered by pure LLM reasoning with chain-of-thought.
+        Stores full decision in self._last_cognitive_decision for access by other methods.
 
         Returns: question | task | summary | insight | risk | execute
         """
+        try:
+            # Use Cognitive Decision Engine for LLM-driven reasoning
+            decision = await self.cognitive_engine.make_decision(
+                query=query,
+                org_id=org_id or "default",
+                user_id=user_id,
+                context=context
+            )
+
+            # Store decision for access by route_to_modules() and other methods
+            self._last_cognitive_decision = decision
+
+            app_logger.info(
+                f"[ORCHESTRATOR] Cognitive decision: intent={decision.intent}, "
+                f"confidence={decision.confidence:.2f}, "
+                f"modules={decision.recommended_modules}, "
+                f"agent={decision.recommended_agent}, "
+                f"requires_review={decision.requires_human_review}"
+            )
+
+            return decision.intent
+
+        except Exception as e:
+            app_logger.error(f"[ORCHESTRATOR] Cognitive engine failed: {e}")
+            # Fallback to simple keyword-based classification
+            return self._fallback_classify_intent(query)
+
+    def _fallback_classify_intent(self, query: str) -> str:
+        """
+        Fallback intent classification using simple keyword heuristics.
+        Used only when Cognitive Decision Engine fails.
+        """
         query_lower = query.lower()
 
-        # Check for execution/action keywords (Phase 4 addition)
-        execution_keywords = [
-            "execute", "run", "launch", "start", "initiate", "perform",
-            "carry out", "implement", "deploy", "activate", "trigger",
-            "automate", "schedule", "send", "post", "publish", "update"
-        ]
-
-        # Check for approval/confirmation keywords (for plan approval)
-        approval_keywords = [
-            "yes", "approve", "confirm", "proceed", "go ahead",
-            "accept", "agreed", "ok", "okay", "sure", "do it"
-        ]
-        approval_context_keywords = ["plan", "action", "execution"]
-
-        # If query contains approval word + optional context word, treat as execution
-        if any(word in query_lower for word in approval_keywords):
-            # Check if there's context suggesting plan approval
-            has_approval_context = any(ctx in query_lower for ctx in approval_context_keywords)
-            if has_approval_context or len(query.strip().split()) <= 3:
-                # Short affirmative response or explicit plan approval
-                return "execute"
-
-        if any(word in query_lower for word in execution_keywords):
+        # Detect action requests
+        action_keywords = ["send", "create", "post", "schedule", "execute", "run"]
+        if any(word in query_lower for word in action_keywords):
             return "execute"
 
-        # Keyword-based heuristics
-        if any(word in query_lower for word in ["summarize", "summary", "overview", "recap"]):
-            return "summary"
-
-        if any(word in query_lower for word in ["risk", "danger", "warning", "concern", "threat"]):
-            return "risk"
-
-        if any(word in query_lower for word in ["insight", "trend", "pattern", "analysis", "what's happening"]):
-            return "insight"
-
-        if any(word in query_lower for word in ["create", "make", "build", "generate", "do", "task"]):
-            # Check if it's about executing vs just planning
-            if any(exec_word in query_lower for exec_word in execution_keywords):
-                return "execute"
-            return "task"
-
-        # Default to question
-        if "?" in query or any(word in query_lower for word in ["what", "who", "when", "where", "why", "how"]):
+        # Detect questions
+        if "?" in query or query_lower.startswith(("what", "who", "when", "where", "why", "how")):
             return "question"
 
-        # Use LLM for complex cases
+        # Default to question
+        return "question"
+
+    async def _check_conversation_continuation(
+        self,
+        query: str,
+        org_id: str,
+        user_id: Optional[str],
+        memories: List[Dict[str, Any]]
+    ) -> str:
+        """
+        Check if current query is a continuation of a previous incomplete request.
+
+        Detects patterns like:
+        - AI: "What message would you like to send?"
+        - User: "product launch date..."
+
+        Returns enriched query combining original context + current response.
+        """
         try:
-            prompt = f"""Classify the following query into one category: question, task, summary, insight, risk, or execute.
+            # Get recent conversation history from database
+            recent_messages = self.supabase.table("reasoning_logs")\
+                .select("query, final_answer, created_at")\
+                .eq("org_id", org_id)\
+                .order("created_at", desc=True)\
+                .limit(3)\
+                .execute()
 
-'execute' means the user wants to take action or automate something.
-'task' means the user is asking about how to do something but not necessarily do it now.
+            if not recent_messages.data or len(recent_messages.data) < 2:
+                return query  # Not enough history
 
-Query: "{query}"
+            # Get the last AI response
+            last_ai_response = recent_messages.data[0].get("final_answer", "")
 
-Respond with ONLY the category name, nothing else."""
+            # Check if last AI response was a clarifying question
+            clarifying_indicators = [
+                "what message",
+                "which channel",
+                "what would you like",
+                "could you provide",
+                "could you tell me",
+                "please specify",
+                "what should i",
+                "where should i"
+            ]
+
+            is_clarifying_question = any(
+                indicator in last_ai_response.lower()
+                for indicator in clarifying_indicators
+            )
+
+            if not is_clarifying_question:
+                # Check for retry request
+                retry_keywords = ["try again", "retry", "again", "do it", "go ahead"]
+                if any(keyword in query.lower() for keyword in retry_keywords):
+                    # Find the last user query (2 messages back)
+                    if len(recent_messages.data) >= 2:
+                        original_query = recent_messages.data[1].get("query", "")
+                        app_logger.info(f"[ORCHESTRATOR] Retry detected, using original query: {original_query[:50]}...")
+                        return original_query
+
+                return query  # No continuation detected
+
+            # This is a continuation! Combine with original request
+            # The original incomplete request is 2 messages back
+            if len(recent_messages.data) >= 2:
+                original_query = recent_messages.data[1].get("query", "")
+
+                app_logger.info(
+                    f"[ORCHESTRATOR] Conversation continuation detected:\n"
+                    f"  Original: {original_query[:50]}...\n"
+                    f"  Follow-up: {query[:50]}..."
+                )
+
+                # Use LLM to intelligently combine the requests
+                enriched = await self._combine_conversation_turns(
+                    original_query,
+                    last_ai_response,
+                    query
+                )
+
+                return enriched
+
+            return query
+
+        except Exception as e:
+            app_logger.error(f"[ORCHESTRATOR] Conversation continuation check failed: {e}")
+            return query
+
+    async def _combine_conversation_turns(
+        self,
+        original_query: str,
+        ai_question: str,
+        user_response: str
+    ) -> str:
+        """
+        Use LLM to intelligently combine multi-turn conversation into complete request.
+
+        Args:
+            original_query: Original incomplete request (e.g., "send a message in slack")
+            ai_question: AI's clarifying question (e.g., "What message would you like to send?")
+            user_response: User's answer (e.g., "product launch date, send to #private-ch")
+
+        Returns:
+            Complete enriched query combining all information
+        """
+        try:
+            prompt = f"""Combine this multi-turn conversation into a single, complete request.
+
+**Original Request:** "{original_query}"
+
+**AI Asked:** "{ai_question}"
+
+**User Answered:** "{user_response}"
+
+Combine these into ONE complete request that includes ALL the information.
+
+Return ONLY the combined request, no explanation.
+
+Examples:
+
+Original: "send a message in slack"
+AI Asked: "What message would you like to send, and which channel?"
+User Answered: "product launch date, 17th nov 2025, send to private-ch channel"
+Combined: "send a message in slack about product launch date 17th nov 2025 to private-ch channel"
+
+Original: "create a task"
+AI Asked: "What task would you like to create?"
+User Answered: "review Q4 budget by Friday"
+Combined: "create a task to review Q4 budget by Friday"
+
+Now combine the conversation above:"""
 
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -117,19 +247,22 @@ Respond with ONLY the category name, nothing else."""
                 json={
                     "model": "llama-3.3-70b-versatile",
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 10
-                }
+                    "temperature": 0.3,
+                    "max_tokens": 200
+                },
+                timeout=10
             )
 
             if response.status_code == 200:
-                intent = response.json()["choices"][0]["message"]["content"].strip().lower()
-                if intent in ["question", "task", "summary", "insight", "risk", "execute"]:
-                    return intent
-        except Exception as e:
-            print(f"[ORCHESTRATOR] LLM intent classification failed: {e}")
+                combined = response.json()["choices"][0]["message"]["content"].strip()
+                app_logger.info(f"[ORCHESTRATOR] Combined query: {combined}")
+                return combined
 
-        return "question"  # Default fallback
+            return f"{original_query} {user_response}"  # Fallback: simple concatenation
+
+        except Exception as e:
+            app_logger.error(f"[ORCHESTRATOR] Failed to combine conversation: {e}")
+            return f"{original_query} {user_response}"  # Fallback
 
     def apply_meta_rules(self, query: str, intent: str, org_id: str, base_modules: List[str]) -> List[str]:
         """
@@ -189,10 +322,20 @@ Respond with ONLY the category name, nothing else."""
     def route_to_modules(self, query: str, intent: str, org_id: str) -> List[str]:
         """
         Determine which modules to use based on intent and query content.
-        Now enhanced with meta-learning (Phase 3, Step 4)
+        Now enhanced with Cognitive Decision Engine recommendations.
 
         Returns: List of module names to query
         """
+        # PRIORITY 1: Use Cognitive Decision Engine recommendations if available
+        if hasattr(self, '_last_cognitive_decision') and self._last_cognitive_decision:
+            decision = self._last_cognitive_decision
+            app_logger.info(
+                f"[ORCHESTRATOR] Using cognitive engine module recommendations: "
+                f"{decision.recommended_modules}"
+            )
+            return decision.recommended_modules
+
+        # FALLBACK: Use heuristic-based module selection
         modules = []
         query_lower = query.lower()
 
@@ -213,7 +356,7 @@ Respond with ONLY the category name, nothing else."""
 
         base_modules = list(set(modules))  # Remove duplicates
 
-        # Apply meta-rules to refine module selection (Phase 3, Step 4)
+        # Apply meta-rules to refine module selection
         refined_modules = self.apply_meta_rules(query, intent, org_id, base_modules)
 
         return refined_modules
@@ -307,6 +450,23 @@ Respond with ONLY the category name, nothing else."""
             should_act, reason = await agent.observe(obs_context)
 
             if not should_act:
+                # Check if agent needs more information (interactive gathering)
+                if reason and reason.startswith("NEED_INFO:"):
+                    # Extract the conversational question
+                    clarifying_question = reason.replace("NEED_INFO:", "").strip()
+                    app_logger.info(
+                        f"[ORCHESTRATOR] Agent needs more info, asking: {clarifying_question}"
+                    )
+                    return {
+                        "success": True,
+                        "action_needed": False,
+                        "needs_more_info": True,
+                        "clarifying_question": clarifying_question,
+                        "reason": clarifying_question,  # For backward compatibility
+                        "agent_type": agent_type
+                    }
+
+                # No action needed and no info requested
                 return {
                     "success": True,
                     "action_needed": False,
@@ -731,22 +891,21 @@ Respond with ONLY the category name, nothing else."""
 
         # Create system prompt based on intent
         intent_instructions = {
-            "question": "Answer the user's question directly and accurately using the provided context.",
+            "question": "Answer naturally and conversationally. For greetings, just greet back warmly. For questions, answer directly using the context without over-explaining.",
             "task": "Provide clear, actionable steps to complete the requested task.",
             "summary": "Provide a comprehensive summary of the relevant information.",
             "insight": "Analyze the data and provide meaningful insights and patterns.",
             "risk": "Identify potential risks, concerns, and recommendations."
         }
 
-        system_prompt = f"""You are Vibodh AI, an intelligent assistant analyzing company knowledge.
+        system_prompt = f"""You are Vibodh AI, a helpful and conversational assistant for company knowledge.
 
-Intent: {intent}
-Instructions: {intent_instructions.get(intent, 'Respond helpfully and accurately.')}
+{intent_instructions.get(intent, 'Respond helpfully and naturally.')}
 
-Context from multiple sources:
+Context from knowledge base:
 {context}
 
-Provide a clear, well-structured response."""
+Be direct, natural, and conversational. Don't explain what you're doing - just do it."""
 
         # Call Groq API
         try:
@@ -821,8 +980,26 @@ Provide a clear, well-structured response."""
         except Exception as e:
             print(f"[ORCHESTRATOR] Failed to retrieve memories: {e}")
 
-        # Step 1: Classify intent
-        intent = self.classify_intent(query)
+        # Step 0c: Check for conversation continuation (interactive multi-turn)
+        # If the last AI response was a clarifying question, combine contexts
+        enriched_query = await self._check_conversation_continuation(
+            query=query,
+            org_id=org_id,
+            user_id=user_id,
+            memories=memories
+        )
+
+        if enriched_query != query:
+            print(f"[ORCHESTRATOR] Detected conversation continuation, enriched query: {enriched_query[:100]}...")
+            query = enriched_query  # Use the enriched query for the rest of processing
+
+        # Step 1: Classify intent using Cognitive Decision Engine
+        intent = await self.classify_intent(
+            query=query,
+            org_id=org_id,
+            user_id=user_id,
+            context={"memories": memories} if memories else {}
+        )
         print(f"[ORCHESTRATOR] Classified intent: {intent}")
 
         # Step 1b: Check for execution intent (Phase 4)
@@ -860,7 +1037,12 @@ Provide a clear, well-structured response."""
                         final_answer += "✅ This plan has been queued for automatic execution.\n"
                         final_answer += "You can monitor progress in the Agents dashboard."
                 else:
-                    final_answer = agent_result.get("reason", "No action was needed for your request.")
+                    # Check if this is an interactive info gathering response
+                    if agent_result.get("needs_more_info"):
+                        # Return the clarifying question as a natural conversational response
+                        final_answer = agent_result.get("clarifying_question", "Could you provide more details?")
+                    else:
+                        final_answer = agent_result.get("reason", "No action was needed for your request.")
             else:
                 final_answer = f"I couldn't create an action plan: {agent_result.get('error', 'Unknown error')}"
                 if agent_result.get("suggestion"):
@@ -964,20 +1146,25 @@ Provide a clear, well-structured response."""
 
         # Add memory sources
         if memories:
-            for memory in memories[:3]:
+            for idx, memory in enumerate(memories[:3]):
                 context_sources.append({
+                    "id": memory.get("id", f"memory-{idx}"),  # Use actual memory ID or generate one
                     "type": "memory",
                     "title": memory.get("title", "Untitled Memory"),
-                    "source": memory.get("memory_type", "conversation")
+                    "source": memory.get("memory_type", "conversation"),
+                    "snippet": memory.get("content", "")[:100] + "..." if memory.get("content") else ""
                 })
 
         # Add document sources
         if "rag" in module_results and module_results["rag"].get("success"):
-            for result in module_results["rag"].get("results", [])[:5]:
+            for idx, result in enumerate(module_results["rag"].get("results", [])[:5]):
                 context_sources.append({
+                    "id": result.get("id", f"doc-{idx}"),  # Use actual document ID or generate one
                     "type": "document",
                     "title": result.get("title", "Untitled"),
-                    "source": result.get("source_type", "unknown")
+                    "source": result.get("source_type", "unknown"),
+                    "snippet": result.get("content", "")[:100] + "..." if result.get("content") else "",
+                    "score": result.get("similarity_score")  # Add relevance score if available
                 })
 
         # Step 6: Log reasoning

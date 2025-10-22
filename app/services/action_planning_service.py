@@ -101,7 +101,10 @@ class ActionPlanningService:
                 "requires_approval": plan.requires_approval,
                 "approval_status": "pending" if plan.requires_approval else None,
                 "context": plan.context,
-                "initiated_by": user_id
+                "initiated_by": user_id,
+                # Add missing fields that were calculated by the agent
+                "confidence_score": plan.confidence_score,
+                "estimated_total_duration_ms": plan.estimated_total_duration_ms
             }
 
             result = self.supabase.table("ai_action_plans").insert(plan_data).execute()

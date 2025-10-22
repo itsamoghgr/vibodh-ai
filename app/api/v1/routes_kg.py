@@ -31,17 +31,18 @@ async def get_kg_stats(org_id: str):
 async def get_entities(
     org_id: str,
     entity_type: str = Query(None, description="Filter by entity type"),
-    limit: int = Query(default=50, ge=1, le=200)
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, description="Number of records to skip for pagination")
 ):
     """
-    Get entities from the knowledge graph
+    Get entities from the knowledge graph with pagination support
     """
     try:
         query = supabase.table("kg_entities")\
             .select("*")\
             .eq("org_id", org_id)\
             .order("created_at", desc=True)\
-            .limit(limit)
+            .range(offset, offset + limit - 1)
 
         if entity_type:
             query = query.eq("type", entity_type)
@@ -50,7 +51,9 @@ async def get_entities(
 
         return {
             "entities": result.data if result.data else [],
-            "count": len(result.data) if result.data else 0
+            "count": len(result.data) if result.data else 0,
+            "offset": offset,
+            "limit": limit
         }
 
     except Exception as e:
@@ -62,17 +65,18 @@ async def get_entities(
 async def get_edges(
     org_id: str,
     relation: str = Query(None, description="Filter by relation type"),
-    limit: int = Query(default=50, ge=1, le=200)
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, description="Number of records to skip for pagination")
 ):
     """
-    Get relationship edges from the knowledge graph
+    Get relationship edges from the knowledge graph with pagination support
     """
     try:
         query = supabase.table("kg_edges")\
             .select("*, source:kg_entities!kg_edges_source_id_fkey(name, type), target:kg_entities!kg_edges_target_id_fkey(name, type)")\
             .eq("org_id", org_id)\
             .order("created_at", desc=True)\
-            .limit(limit)
+            .range(offset, offset + limit - 1)
 
         if relation:
             query = query.eq("relation", relation)
@@ -81,7 +85,9 @@ async def get_edges(
 
         return {
             "edges": result.data if result.data else [],
-            "count": len(result.data) if result.data else 0
+            "count": len(result.data) if result.data else 0,
+            "offset": offset,
+            "limit": limit
         }
 
     except Exception as e:

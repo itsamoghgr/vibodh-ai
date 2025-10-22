@@ -62,7 +62,7 @@ class MemoryService:
             logger.info(f"Storing memory for org {org_id}: {title}")
 
             # Generate embedding for content
-            embeddings = await self.embedding_service.generate_embeddings([content])
+            embeddings = self.embedding_service.generate_embeddings_batch([content])
             embedding = embeddings[0] if embeddings else None
 
             # Prepare memory data
