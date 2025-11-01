@@ -1,9 +1,10 @@
 """
 Meta Ads Service - Phase 6
-Mock implementation of Meta Marketing API (Facebook/Instagram Ads) for development
+Production and Mock implementation of Meta Marketing API (Facebook/Instagram Ads)
 
 In mock mode, simulates Meta Marketing API responses with realistic synthetic data.
-Designed to be easily swappable with real Facebook Business SDK when ready.
+In production mode, uses official Facebook Business SDK.
+Mode is controlled by settings.ADS_MOCK_MODE.
 """
 
 from typing import List, Dict, Any, Optional
@@ -13,6 +14,8 @@ from app.core.config import settings
 from app.core.logging import logger
 from app.services.ads_synthetic_data_generator import get_synthetic_generator
 import time
+import json
+import requests
 
 
 class MetaAdsService:
@@ -37,16 +40,31 @@ class MetaAdsService:
         self.supabase = supabase
         self.mock_mode = mock_mode or settings.ADS_MOCK_MODE
         self.generator = get_synthetic_generator() if self.mock_mode else None
+        self.api_version = "v19.0"  # Meta API version
+        self.graph_api_url = f"https://graph.facebook.com/{self.api_version}"
 
         if not self.mock_mode:
             # In production, initialize real Facebook Business SDK
-            # from facebook_business.api import FacebookAdsApi
-            # FacebookAdsApi.init(
-            #     app_id=settings.META_ADS_APP_ID,
-            #     app_secret=settings.META_ADS_APP_SECRET,
-            #     access_token=access_token
-            # )
-            logger.warning("Meta Ads Service initialized in PRODUCTION mode but not implemented yet")
+            try:
+                from facebook_business.api import FacebookAdsApi
+
+                # Initialize the API (access token will be set per-request)
+                FacebookAdsApi.init(
+                    app_id=settings.META_ADS_APP_ID,
+                    app_secret=settings.META_ADS_APP_SECRET,
+                    access_token=None  # Will be set per-request
+                )
+
+                self.app_secret = settings.META_ADS_APP_SECRET
+                logger.info("Meta Ads Service initialized in PRODUCTION mode")
+            except ImportError:
+                logger.error(
+                    "facebook-business library not installed. Run: pip install facebook-business==19.0.0"
+                )
+                raise
+            except Exception as e:
+                logger.error(f"Failed to initialize Meta Ads SDK: {e}")
+                raise
 
         logger.info(f"Meta Ads Service initialized (mock_mode={self.mock_mode})")
 
@@ -63,12 +81,37 @@ class MetaAdsService:
         """
         if self.mock_mode:
             # Return mock URL
-            return f"https://www.facebook.com/v18.0/dialog/oauth?mock=true&org_id={org_id}&redirect_uri={redirect_uri}"
+            return f"https://www.facebook.com/{self.api_version}/dialog/oauth?mock=true&org_id={org_id}&redirect_uri={redirect_uri}"
 
-        # In production:
-        # scope = "ads_read,ads_management,business_management"
-        # return f"https://www.facebook.com/v18.0/dialog/oauth?client_id={settings.META_ADS_APP_ID}&redirect_uri={redirect_uri}&scope={scope}"
-        raise NotImplementedError("Production OAuth not implemented")
+        # In production: Build Facebook OAuth URL
+        try:
+            import urllib.parse
+
+            # Required scopes for Meta Marketing API
+            scopes = [
+                "ads_read",
+                "ads_management",
+                "business_management",
+                "read_insights"
+            ]
+
+            # Build OAuth URL
+            params = {
+                "client_id": settings.META_ADS_APP_ID,
+                "redirect_uri": redirect_uri,
+                "state": org_id,  # CSRF protection
+                "scope": ",".join(scopes),
+                "response_type": "code"
+            }
+
+            authorization_url = f"https://www.facebook.com/{self.api_version}/dialog/oauth?" + urllib.parse.urlencode(params)
+
+            logger.info(f"Generated Meta Ads OAuth URL for org {org_id}")
+            return authorization_url
+
+        except Exception as e:
+            logger.error(f"Failed to generate OAuth URL: {e}")
+            raise
 
     def exchange_authorization_code(
         self,
@@ -93,9 +136,35 @@ class MetaAdsService:
                 "expires_in": 5183944  # ~60 days (Meta's default)
             }
 
-        # In production:
-        # Make request to https://graph.facebook.com/v18.0/oauth/access_token
-        raise NotImplementedError("Production OAuth not implemented")
+        # In production: Exchange code for access token
+        try:
+            token_url = f"{self.graph_api_url}/oauth/access_token"
+
+            params = {
+                "client_id": settings.META_ADS_APP_ID,
+                "client_secret": settings.META_ADS_APP_SECRET,
+                "redirect_uri": redirect_uri,
+                "code": authorization_code
+            }
+
+            response = requests.get(token_url, params=params)
+            response.raise_for_status()
+
+            token_data = response.json()
+
+            logger.info("Successfully exchanged authorization code for Meta Ads access token")
+            return {
+                "access_token": token_data["access_token"],
+                "token_type": "bearer",
+                "expires_in": token_data.get("expires_in", 5183944)
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"Failed to exchange authorization code: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during token exchange: {e}")
+            raise
 
     def exchange_short_lived_for_long_lived_token(
         self,
@@ -117,9 +186,35 @@ class MetaAdsService:
                 "expires_in": 5183944  # ~60 days
             }
 
-        # In production:
-        # Make request to /oauth/access_token with grant_type=fb_exchange_token
-        raise NotImplementedError("Production token exchange not implemented")
+        # In production: Exchange for long-lived token
+        try:
+            token_url = f"{self.graph_api_url}/oauth/access_token"
+
+            params = {
+                "grant_type": "fb_exchange_token",
+                "client_id": settings.META_ADS_APP_ID,
+                "client_secret": settings.META_ADS_APP_SECRET,
+                "fb_exchange_token": short_lived_token
+            }
+
+            response = requests.get(token_url, params=params)
+            response.raise_for_status()
+
+            token_data = response.json()
+
+            logger.info("Successfully exchanged for long-lived Meta Ads token")
+            return {
+                "access_token": token_data["access_token"],
+                "token_type": "bearer",
+                "expires_in": token_data.get("expires_in", 5183944)  # ~60 days
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"Failed to exchange for long-lived token: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error during token exchange: {e}")
+            raise
 
     def list_ad_accounts(self, access_token: str) -> List[Dict[str, Any]]:
         """
@@ -156,18 +251,63 @@ class MetaAdsService:
             logger.info(f"[MOCK] Listed {len(accounts)} Meta ad accounts")
             return accounts
 
-        # In production:
-        # from facebook_business.adobjects.user import User
-        # from facebook_business.adobjects.adaccount import AdAccount
-        # me = User(fbid='me')
-        # accounts = me.get_ad_accounts(fields=[
-        #     AdAccount.Field.account_id,
-        #     AdAccount.Field.name,
-        #     AdAccount.Field.currency,
-        #     AdAccount.Field.account_status
-        # ])
-        # return [account.export_all_data() for account in accounts]
-        raise NotImplementedError("Production account listing not implemented")
+        # In production: Fetch ad accounts using Facebook Business SDK
+        try:
+            from facebook_business.adobjects.user import User
+            from facebook_business.adobjects.adaccount import AdAccount
+            from facebook_business.api import FacebookAdsApi
+
+            # Set API session with access token
+            api = FacebookAdsApi.init(
+                app_id=settings.META_ADS_APP_ID,
+                app_secret=settings.META_ADS_APP_SECRET,
+                access_token=access_token
+            )
+
+            # Get current user
+            me = User(fbid='me', api=api)
+
+            # Fetch ad accounts with detailed fields
+            accounts_data = me.get_ad_accounts(fields=[
+                AdAccount.Field.account_id,
+                AdAccount.Field.id,
+                AdAccount.Field.name,
+                AdAccount.Field.account_status,
+                AdAccount.Field.currency,
+                AdAccount.Field.timezone_name,
+                AdAccount.Field.timezone_offset_hours_utc,
+                AdAccount.Field.business_name,
+                AdAccount.Field.business,
+                AdAccount.Field.is_prepay_account,
+                AdAccount.Field.amount_spent,
+                AdAccount.Field.balance
+            ])
+
+            # Convert to list of dicts
+            accounts = []
+            for account in accounts_data:
+                account_dict = {
+                    "account_id": account.get(AdAccount.Field.account_id),
+                    "id": account.get(AdAccount.Field.id),
+                    "name": account.get(AdAccount.Field.name),
+                    "account_status": account.get(AdAccount.Field.account_status),
+                    "currency": account.get(AdAccount.Field.currency),
+                    "timezone_name": account.get(AdAccount.Field.timezone_name),
+                    "timezone_offset_hours_utc": account.get(AdAccount.Field.timezone_offset_hours_utc),
+                    "business_name": account.get(AdAccount.Field.business_name),
+                    "business_id": account.get(AdAccount.Field.business, {}).get('id') if account.get(AdAccount.Field.business) else None,
+                    "is_prepay_account": account.get(AdAccount.Field.is_prepay_account),
+                    "amount_spent": account.get(AdAccount.Field.amount_spent),
+                    "balance": account.get(AdAccount.Field.balance)
+                }
+                accounts.append(account_dict)
+
+            logger.info(f"Listed {len(accounts)} Meta ad accounts")
+            return accounts
+
+        except Exception as e:
+            logger.error(f"Failed to list Meta ad accounts: {e}")
+            raise
 
     def get_campaigns(
         self,
@@ -233,22 +373,71 @@ class MetaAdsService:
             logger.info(f"[MOCK] Fetched {len(campaigns)} campaigns")
             return campaigns
 
-        # In production:
-        # from facebook_business.adobjects.adaccount import AdAccount
-        # from facebook_business.adobjects.campaign import Campaign
-        # account = AdAccount(ad_account_id)
-        # campaigns = account.get_campaigns(fields=[
-        #     Campaign.Field.id,
-        #     Campaign.Field.name,
-        #     Campaign.Field.status,
-        #     Campaign.Field.objective,
-        #     Campaign.Field.daily_budget,
-        #     Campaign.Field.lifetime_budget,
-        #     Campaign.Field.start_time,
-        #     Campaign.Field.stop_time
-        # ])
-        # return [campaign.export_all_data() for campaign in campaigns]
-        raise NotImplementedError("Production campaign fetching not implemented")
+        # In production: Fetch campaigns using Facebook Business SDK
+        try:
+            from facebook_business.adobjects.adaccount import AdAccount
+            from facebook_business.adobjects.campaign import Campaign
+            from facebook_business.api import FacebookAdsApi
+
+            # Set API session with access token
+            api = FacebookAdsApi.init(
+                app_id=settings.META_ADS_APP_ID,
+                app_secret=settings.META_ADS_APP_SECRET,
+                access_token=access_token
+            )
+
+            # Get ad account
+            account = AdAccount(ad_account_id, api=api)
+
+            # Define fields to fetch
+            fields = [
+                Campaign.Field.id,
+                Campaign.Field.name,
+                Campaign.Field.status,
+                Campaign.Field.effective_status,
+                Campaign.Field.objective,
+                Campaign.Field.budget_remaining,
+                Campaign.Field.daily_budget,
+                Campaign.Field.lifetime_budget,
+                Campaign.Field.start_time,
+                Campaign.Field.stop_time,
+                Campaign.Field.created_time,
+                Campaign.Field.updated_time
+            ]
+
+            # Build params - optionally filter by status
+            params = {}
+            if not include_archived:
+                params['effective_status'] = ['ACTIVE', 'PAUSED']
+
+            # Fetch campaigns
+            campaigns_data = account.get_campaigns(fields=fields, params=params)
+
+            # Convert to list of dicts
+            campaigns = []
+            for campaign in campaigns_data:
+                campaign_dict = {
+                    "id": campaign.get(Campaign.Field.id),
+                    "name": campaign.get(Campaign.Field.name),
+                    "status": campaign.get(Campaign.Field.status),
+                    "effective_status": campaign.get(Campaign.Field.effective_status),
+                    "objective": campaign.get(Campaign.Field.objective),
+                    "budget_remaining": campaign.get(Campaign.Field.budget_remaining),
+                    "daily_budget": campaign.get(Campaign.Field.daily_budget),
+                    "lifetime_budget": campaign.get(Campaign.Field.lifetime_budget),
+                    "start_time": campaign.get(Campaign.Field.start_time),
+                    "stop_time": campaign.get(Campaign.Field.stop_time),
+                    "created_time": campaign.get(Campaign.Field.created_time),
+                    "updated_time": campaign.get(Campaign.Field.updated_time)
+                }
+                campaigns.append(campaign_dict)
+
+            logger.info(f"Fetched {len(campaigns)} campaigns for account {ad_account_id}")
+            return campaigns
+
+        except Exception as e:
+            logger.error(f"Failed to fetch Meta Ads campaigns: {e}")
+            raise
 
     def get_campaign_insights(
         self,
@@ -332,27 +521,87 @@ class MetaAdsService:
             logger.info(f"[MOCK] Generated {len(insights)} daily insights")
             return insights
 
-        # In production:
-        # from facebook_business.adobjects.campaign import Campaign
-        # from facebook_business.adobjects.adsinsights import AdsInsights
-        # campaign = Campaign(campaign_id)
-        # insights = campaign.get_insights(fields=[
-        #     AdsInsights.Field.impressions,
-        #     AdsInsights.Field.clicks,
-        #     AdsInsights.Field.ctr,
-        #     AdsInsights.Field.spend,
-        #     AdsInsights.Field.reach,
-        #     AdsInsights.Field.frequency,
-        #     AdsInsights.Field.actions,
-        #     AdsInsights.Field.cpc,
-        #     AdsInsights.Field.cpm
-        # ], params={
-        #     'time_range': {'since': start_date.isoformat(), 'until': end_date.isoformat()},
-        #     'time_increment': 1,  # daily
-        #     'level': 'campaign'
-        # })
-        # return [insight.export_all_data() for insight in insights]
-        raise NotImplementedError("Production insights fetching not implemented")
+        # In production: Fetch insights using Facebook Business SDK
+        try:
+            from facebook_business.adobjects.campaign import Campaign
+            from facebook_business.adobjects.adsinsights import AdsInsights
+            from facebook_business.api import FacebookAdsApi
+
+            # Set API session with access token
+            api = FacebookAdsApi.init(
+                app_id=settings.META_ADS_APP_ID,
+                app_secret=settings.META_ADS_APP_SECRET,
+                access_token=access_token
+            )
+
+            # Get campaign object
+            campaign = Campaign(campaign_id, api=api)
+
+            # Define fields to fetch
+            fields = [
+                AdsInsights.Field.date_start,
+                AdsInsights.Field.date_stop,
+                AdsInsights.Field.impressions,
+                AdsInsights.Field.clicks,
+                AdsInsights.Field.ctr,
+                AdsInsights.Field.spend,
+                AdsInsights.Field.reach,
+                AdsInsights.Field.frequency,
+                AdsInsights.Field.actions,
+                AdsInsights.Field.action_values,
+                AdsInsights.Field.cost_per_action_type,
+                AdsInsights.Field.cpc,
+                AdsInsights.Field.cpm,
+                AdsInsights.Field.video_30_sec_watched_actions
+            ]
+
+            # Map breakdown to time_increment
+            time_increment_map = {
+                "day": 1,
+                "week": 7,
+                "month": "monthly"
+            }
+
+            # Build params
+            params = {
+                'time_range': {
+                    'since': start_date.strftime('%Y-%m-%d'),
+                    'until': end_date.strftime('%Y-%m-%d')
+                },
+                'time_increment': time_increment_map.get(breakdown, 1),
+                'level': 'campaign'
+            }
+
+            # Fetch insights
+            insights_data = campaign.get_insights(fields=fields, params=params)
+
+            # Convert to list of dicts
+            insights = []
+            for insight in insights_data:
+                insight_dict = {
+                    "date_start": insight.get(AdsInsights.Field.date_start),
+                    "date_stop": insight.get(AdsInsights.Field.date_stop),
+                    "impressions": insight.get(AdsInsights.Field.impressions),
+                    "clicks": insight.get(AdsInsights.Field.clicks),
+                    "ctr": insight.get(AdsInsights.Field.ctr),
+                    "spend": insight.get(AdsInsights.Field.spend),
+                    "reach": insight.get(AdsInsights.Field.reach),
+                    "frequency": insight.get(AdsInsights.Field.frequency),
+                    "actions": insight.get(AdsInsights.Field.actions, []),
+                    "action_values": insight.get(AdsInsights.Field.action_values, []),
+                    "cost_per_action_type": insight.get(AdsInsights.Field.cost_per_action_type, []),
+                    "cpc": insight.get(AdsInsights.Field.cpc),
+                    "cpm": insight.get(AdsInsights.Field.cpm),
+                    "video_30_sec_watched_actions": insight.get(AdsInsights.Field.video_30_sec_watched_actions, [])
+                }
+                insights.append(insight_dict)
+
+            logger.info(f"Fetched {len(insights)} insights for campaign {campaign_id}")
+            return insights
+
+        except Exception as e:
+            logger.error(f"Failed to fetch Meta Ads campaign insights: {e}")
+            raise
 
     def get_account_insights_summary(
         self,

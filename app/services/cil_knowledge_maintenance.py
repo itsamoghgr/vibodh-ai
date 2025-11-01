@@ -54,6 +54,8 @@ class CILKnowledgeMaintenanceService:
                 'duplicates_merged': 0,
                 'memories_consolidated': 0,
                 'embeddings_regenerated': 0,
+                'ads_campaigns_archived': 0,  # NEW: Ads-specific
+                'ads_memories_consolidated': 0,  # NEW: Ads-specific
                 'errors': []
             }
 
@@ -101,6 +103,24 @@ class CILKnowledgeMaintenanceService:
             except Exception as e:
                 logger.error(f"Error regenerating embeddings: {e}", exc_info=True)
                 results['errors'].append(f"Embedding regeneration: {str(e)}")
+
+            # 6. Archive ended ads campaigns (Ads-specific)
+            try:
+                ads_archived_count = await self._archive_ended_campaigns(org_id)
+                results['ads_campaigns_archived'] = ads_archived_count
+                logger.info(f"Archived {ads_archived_count} ended campaigns")
+            except Exception as e:
+                logger.error(f"Error archiving ended campaigns: {e}", exc_info=True)
+                results['errors'].append(f"Ads campaign archival: {str(e)}")
+
+            # 7. Consolidate ads campaign memories (Ads-specific)
+            try:
+                ads_mem_count = await self._consolidate_ads_campaign_memories(org_id)
+                results['ads_memories_consolidated'] = ads_mem_count
+                logger.info(f"Consolidated {ads_mem_count} ads campaign memories")
+            except Exception as e:
+                logger.error(f"Error consolidating ads memories: {e}", exc_info=True)
+                results['errors'].append(f"Ads memory consolidation: {str(e)}")
 
             results['completed_at'] = datetime.utcnow().isoformat()
             results['status'] = 'completed' if not results['errors'] else 'completed_with_errors'
@@ -413,6 +433,202 @@ class CILKnowledgeMaintenanceService:
 
         except Exception as e:
             logger.error(f"Error regenerating embeddings: {e}", exc_info=True)
+            return 0
+
+    async def _archive_ended_campaigns(self, org_id: str) -> int:
+        """
+        Archive ads campaigns that have ended >180 days ago.
+
+        Args:
+            org_id: Organization ID
+
+        Returns:
+            Count of campaigns archived
+        """
+        try:
+            cutoff_date = (datetime.utcnow() - timedelta(days=180)).isoformat()
+
+            # Find ended campaigns from KG entities (linked via ads_kg_links)
+            # Get campaign entities that haven't been accessed in 180 days
+            ended_campaigns_query = self.supabase.table('ads_kg_links')\
+                .select('entity_id, campaign_id')\
+                .eq('org_id', org_id)\
+                .eq('link_type', 'campaign_entity')\
+                .execute()
+
+            if not ended_campaigns_query.data:
+                return 0
+
+            archived_count = 0
+
+            for link in ended_campaigns_query.data:
+                campaign_id = link['campaign_id']
+                entity_id = link['entity_id']
+
+                # Check campaign status and end date
+                campaign_query = self.supabase.table('ad_campaigns')\
+                    .select('status, end_date, updated_at')\
+                    .eq('id', campaign_id)\
+                    .execute()
+
+                if not campaign_query.data:
+                    continue
+
+                campaign = campaign_query.data[0]
+
+                # Archive if ended/deleted and >180 days old
+                should_archive = False
+                if campaign['status'] in ['ended', 'deleted']:
+                    # Parse both datetimes
+                    last_update = datetime.fromisoformat(campaign['updated_at'].replace('Z', '+00:00'))
+                    cutoff_dt = datetime.fromisoformat(cutoff_date.replace('Z', '+00:00'))
+
+                    # Remove timezone info for comparison (both in UTC already)
+                    last_update_naive = last_update.replace(tzinfo=None)
+                    cutoff_dt_naive = cutoff_dt.replace(tzinfo=None)
+
+                    if last_update_naive < cutoff_dt_naive:
+                        should_archive = True
+
+                if should_archive:
+                    # Archive the KG entity
+                    self.supabase.table('kg_entities')\
+                        .update({
+                            'is_archived': True,
+                            'archived_at': datetime.utcnow().isoformat(),
+                            'archived_reason': f'Campaign ended >180 days ago (status: {campaign["status"]})'
+                        })\
+                        .eq('id', entity_id)\
+                        .execute()
+
+                    archived_count += 1
+
+            logger.info(f"Archived {archived_count} ended campaign entities for org {org_id}")
+            return archived_count
+
+        except Exception as e:
+            logger.error(f"Error archiving ended campaigns: {e}", exc_info=True)
+            return 0
+
+    async def _consolidate_ads_campaign_memories(self, org_id: str) -> int:
+        """
+        Consolidate ads campaign memories into monthly summaries.
+
+        Creates monthly summary memories from individual campaign event memories.
+
+        Args:
+            org_id: Organization ID
+
+        Returns:
+            Count of memories consolidated
+        """
+        try:
+            # Get old campaign memories (>30 days) that haven't been consolidated
+            cutoff_date = (datetime.utcnow() - timedelta(days=30)).isoformat()
+
+            old_campaign_memories = self.supabase.table('ai_memory')\
+                .select('id, title, content, memory_type, metadata, created_at, importance')\
+                .eq('org_id', org_id)\
+                .eq('is_consolidated', False)\
+                .lt('created_at', cutoff_date)\
+                .execute()
+
+            if not old_campaign_memories.data:
+                return 0
+
+            # Filter for campaign-related memories
+            campaign_memories = [
+                m for m in old_campaign_memories.data
+                if m.get('metadata', {}).get('campaign_id') or 'campaign' in m.get('title', '').lower()
+            ]
+
+            if len(campaign_memories) < 5:  # Need at least 5 to consolidate
+                return 0
+
+            # Group by month
+            from collections import defaultdict
+            by_month = defaultdict(list)
+
+            for memory in campaign_memories:
+                created = datetime.fromisoformat(memory['created_at'].replace('Z', '+00:00'))
+                month_key = created.strftime('%Y-%m')
+                by_month[month_key].append(memory)
+
+            consolidated_count = 0
+
+            for month, memories in by_month.items():
+                if len(memories) < 5:
+                    continue
+
+                # Create consolidated summary
+                high_performers = [m for m in memories if m.get('metadata', {}).get('event_type') == 'high_performance']
+                poor_performers = [m for m in memories if m.get('metadata', {}).get('event_type') == 'poor_performance']
+                new_campaigns = [m for m in memories if m.get('metadata', {}).get('event_type') == 'campaign_launch']
+
+                summary_parts = [f"### Campaign Activity Summary for {month}"]
+
+                if new_campaigns:
+                    summary_parts.append(f"\n**New Campaigns Launched:** {len(new_campaigns)}")
+
+                if high_performers:
+                    summary_parts.append(f"\n**High Performing Campaigns:** {len(high_performers)}")
+                    for m in high_performers[:3]:  # Top 3
+                        summary_parts.append(f"- {m['title']}")
+
+                if poor_performers:
+                    summary_parts.append(f"\n**Underperforming Campaigns:** {len(poor_performers)}")
+                    for m in poor_performers[:3]:  # Top 3
+                        summary_parts.append(f"- {m['title']}")
+
+                summary_content = "\n".join(summary_parts)
+
+                # Calculate importance based on high vs poor performers
+                importance = 0.7
+                if len(high_performers) > len(poor_performers):
+                    importance = 0.8  # More successes = more important
+                elif len(poor_performers) > 2:
+                    importance = 0.75  # Issues need attention
+
+                # Create consolidated memory
+                consolidated_memory = {
+                    'org_id': org_id,
+                    'memory_type': 'insight',
+                    'title': f"Campaign Activity Summary - {month}",
+                    'content': summary_content,
+                    'importance': importance,
+                    'is_consolidated': True,
+                    'source_refs': [{'memory_id': m['id']} for m in memories],
+                    'metadata': {
+                        'consolidated_from_count': len(memories),
+                        'consolidation_date': datetime.utcnow().isoformat(),
+                        'month': month,
+                        'high_performers': len(high_performers),
+                        'poor_performers': len(poor_performers),
+                        'new_campaigns': len(new_campaigns)
+                    }
+                }
+
+                self.supabase.table('ai_memory')\
+                    .insert(consolidated_memory)\
+                    .execute()
+
+                # Mark originals as consolidated
+                memory_ids = [m['id'] for m in memories]
+                self.supabase.table('ai_memory')\
+                    .update({
+                        'is_consolidated': True,
+                        'consolidated_at': datetime.utcnow().isoformat()
+                    })\
+                    .in_('id', memory_ids)\
+                    .execute()
+
+                consolidated_count += len(memories)
+                logger.info(f"Consolidated {len(memories)} campaign memories for {month}")
+
+            return consolidated_count
+
+        except Exception as e:
+            logger.error(f"Error consolidating ads campaign memories: {e}", exc_info=True)
             return 0
 
     async def _store_maintenance_record(self, results: Dict[str, Any]):

@@ -562,56 +562,55 @@ async def simulate_data(
         supabase = get_supabase_admin_client()
         ingestion_service = get_ads_ingestion_service(supabase)
 
-        # Generate synthetic account
-        if request.platform == "google_ads":
-            service = get_google_ads_service(supabase)
-        elif request.platform == "meta_ads":
-            service = get_meta_ads_service(supabase)
-        else:
+        # Validate platform
+        if request.platform not in ["google_ads", "meta_ads"]:
             raise HTTPException(status_code=400, detail="Invalid platform")
 
-        # Create mock connection
-        mock_connection = supabase.table("connections").insert({
+        # Generate unique account ID for mock data
+        import uuid
+        mock_account_id = f"mock_{request.platform}_{uuid.uuid4().hex[:8]}"
+
+        # Create mock ad_account directly (no connections table needed)
+        logger.info(f"Creating mock ad account for {request.platform}")
+
+        mock_account = supabase.table("ad_accounts").insert({
             "org_id": org_id,
-            "source_type": request.platform,
-            "access_token": "mock_token",
-            "refresh_token": "mock_refresh",
-            "token_expiry": (datetime.utcnow() + timedelta(days=60)).isoformat()
+            "platform": request.platform,
+            "account_id": mock_account_id,
+            "account_name": f"Mock {request.platform.replace('_', ' ').title()} Account",
+            "currency": "USD",
+            "timezone": "UTC",
+            "status": "active",
+            "metadata": {
+                "mock_mode": True,
+                "access_token": "mock_token",
+                "refresh_token": "mock_refresh",
+                "simulated": True,
+                "created_via": "simulate_endpoint"
+            }
         }).execute()
 
-        connection_id = mock_connection.data[0]["id"]
+        if not mock_account.data:
+            raise HTTPException(status_code=500, detail="Failed to create mock account")
 
-        # Connect account
-        if request.platform == "google_ads":
-            accounts = ingestion_service.connect_google_ads_account(
-                org_id=org_id,
-                access_token="mock_token",
-                refresh_token="mock_refresh",
-                connection_id=connection_id
-            )
-        else:
-            accounts = ingestion_service.connect_meta_ads_account(
-                org_id=org_id,
-                access_token="mock_token",
-                connection_id=connection_id
-            )
+        created_account = mock_account.data[0]
+        logger.info(f"Mock account created: {created_account['id']}")
 
-        # Sync data for the first account
-        if accounts:
-            sync_result = ingestion_service.sync_account_data(
-                account_id=accounts[0]["id"],
-                org_id=org_id,
-                days_back=request.days_back
-            )
+        # Sync data for the mock account (generates campaigns and metrics)
+        logger.info(f"Syncing mock data for account {created_account['id']}")
 
-            return {
-                "simulated": True,
-                "platform": request.platform,
-                "account": accounts[0],
-                "sync_result": sync_result
-            }
+        sync_result = ingestion_service.sync_account_data(
+            account_id=created_account["id"],
+            org_id=org_id,
+            days_back=request.days_back
+        )
 
-        raise HTTPException(status_code=500, detail="Failed to simulate data")
+        return {
+            "simulated": True,
+            "platform": request.platform,
+            "account": created_account,
+            "sync_result": sync_result
+        }
 
     except HTTPException:
         raise
@@ -682,4 +681,150 @@ async def check_ads_health(org_id: str):
 
     except Exception as e:
         logger.error(f"Failed to check ads health: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/embed-campaigns/{org_id}")
+async def embed_all_campaigns(org_id: str):
+    """
+    Manually trigger document embedding for all campaigns.
+    Debug endpoint to see what errors occur during document creation.
+    """
+    try:
+        supabase = get_supabase_admin_client()
+        ingestion = get_ads_ingestion_service(supabase)
+
+        # Get all campaigns for this org
+        campaigns = supabase.table("ad_campaigns")\
+            .select("*")\
+            .eq("org_id", org_id)\
+            .execute()
+
+        if not campaigns.data:
+            return {
+                "success": True,
+                "message": "No campaigns to embed",
+                "embedded": 0,
+                "errors": []
+            }
+
+        embedded_count = 0
+        errors = []
+
+        for campaign in campaigns.data:
+            try:
+                ingestion._create_campaign_document(
+                    campaign_db_id=campaign["id"],
+                    org_id=org_id,
+                    campaign_data=campaign
+                )
+                embedded_count += 1
+                logger.info(f"Embedded campaign: {campaign['campaign_name']}")
+            except Exception as e:
+                error_msg = f"Campaign {campaign['campaign_name']}: {str(e)}"
+                errors.append(error_msg)
+                logger.error(f"Failed to embed campaign: {error_msg}", exc_info=True)
+
+        return {
+            "success": len(errors) == 0,
+            "message": f"Embedded {embedded_count} campaigns",
+            "embedded": embedded_count,
+            "total": len(campaigns.data),
+            "errors": errors
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to embed campaigns: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/cleanup/{org_id}")
+async def cleanup_all_ads_data(org_id: str):
+    """
+    Delete all ads data for an organization (campaigns, metrics, documents, accounts).
+    Use with caution - this is for testing/demo purposes.
+    """
+    try:
+        supabase = get_supabase_admin_client()
+
+        # Get all campaigns first (to delete child records)
+        campaigns = supabase.table("ad_campaigns")\
+            .select("id")\
+            .eq("org_id", org_id)\
+            .execute()
+
+        campaign_ids = [c["id"] for c in campaigns.data] if campaigns.data else []
+
+        # Get ads-related documents
+        ads_docs = supabase.table("documents")\
+            .select("id")\
+            .eq("org_id", org_id)\
+            .in_("source_type", ["google_ads", "meta_ads"])\
+            .execute()
+
+        deleted_counts = {
+            "campaigns_before": len(campaign_ids),
+            "documents_before": len(ads_docs.data) if ads_docs.data else 0
+        }
+
+        # Delete in correct order (child to parent)
+
+        # 1. Delete embeddings for ads documents
+        if ads_docs.data:
+            doc_ids = [d["id"] for d in ads_docs.data]
+            supabase.table("embeddings")\
+                .delete()\
+                .in_("document_id", doc_ids)\
+                .execute()
+
+        # 2. Delete ads documents
+        if ads_docs.data:
+            supabase.table("documents")\
+                .delete()\
+                .eq("org_id", org_id)\
+                .in_("source_type", ["google_ads", "meta_ads"])\
+                .execute()
+
+        # 3. Delete CIL ads telemetry
+        supabase.table("cil_ads_telemetry")\
+            .delete()\
+            .eq("org_id", org_id)\
+            .execute()
+
+        # 4. Delete ad metrics (linked via campaign_id)
+        if campaign_ids:
+            supabase.table("ad_metrics")\
+                .delete()\
+                .in_("campaign_id", campaign_ids)\
+                .execute()
+
+        # 5. Delete ad campaigns
+        if campaign_ids:
+            supabase.table("ad_campaigns")\
+                .delete()\
+                .eq("org_id", org_id)\
+                .execute()
+
+        # 6. Delete ad accounts
+        supabase.table("ad_accounts")\
+            .delete()\
+            .eq("org_id", org_id)\
+            .execute()
+
+        # 7. Delete ad sync jobs
+        supabase.table("ad_sync_jobs")\
+            .delete()\
+            .eq("org_id", org_id)\
+            .execute()
+
+        logger.info(f"Cleaned up all ads data for org {org_id}")
+
+        return {
+            "success": True,
+            "message": "All ads data deleted successfully",
+            "deleted": deleted_counts
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to cleanup ads data: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

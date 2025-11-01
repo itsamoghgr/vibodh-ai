@@ -59,7 +59,9 @@ class Settings(BaseSettings):
 
     # Ads Integration Settings (Phase 6)
     ADS_MOCK_MODE: bool = True  # Use synthetic data instead of real APIs
+    ADS_WORKER_ENABLED: bool = True  # Enable automatic ads sync worker
     ADS_SYNC_INTERVAL_HOURS: int = 1  # How often to sync ad data
+    ADS_ANOMALY_CHECK_TIME: str = "4:00"  # UTC time (HH:MM) for daily anomaly detection
     ADS_DEFAULT_LOOKBACK_DAYS: int = 90  # Default historical data window
 
     # SMTP Email

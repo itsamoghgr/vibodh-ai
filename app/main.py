@@ -13,7 +13,7 @@ from app.api.v1 import api_v1_router
 from app.db import supabase
 from app.services.agent_registry import get_agent_registry
 from app.agents import MarketingAgent, CommunicationAgent
-from app.workers import start_cil_worker, stop_cil_worker
+from app.workers import start_cil_worker, stop_cil_worker, start_ads_worker, stop_ads_worker
 
 
 @asynccontextmanager
@@ -62,6 +62,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start CIL worker: {e}")
 
+    # Start Ads worker (Phase 6)
+    try:
+        import os
+        # Check if Ads worker is enabled via environment variable
+        ads_worker_enabled = os.getenv("ADS_WORKER_ENABLED", "true").lower() == "true"
+
+        if ads_worker_enabled:
+            start_ads_worker(
+                sync_interval_hours=int(os.getenv("ADS_SYNC_INTERVAL_HOURS", "1")),  # Default hourly
+                anomaly_check_time=os.getenv("ADS_ANOMALY_CHECK_TIME", "4:00"),  # Default 4 AM UTC
+                enabled=True
+            )
+            logger.info("📊 Ads worker started successfully")
+        else:
+            logger.info("Ads worker disabled via configuration")
+    except Exception as e:
+        logger.error(f"Failed to start Ads worker: {e}")
+
     yield
 
     # Shutdown
@@ -73,6 +91,13 @@ async def lifespan(app: FastAPI):
         logger.info("CIL worker stopped")
     except Exception as e:
         logger.error(f"Error stopping CIL worker: {e}")
+
+    # Stop Ads worker
+    try:
+        stop_ads_worker()
+        logger.info("Ads worker stopped")
+    except Exception as e:
+        logger.error(f"Error stopping Ads worker: {e}")
 
 
 # Create FastAPI app

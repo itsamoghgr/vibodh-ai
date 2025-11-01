@@ -1,0 +1,64 @@
+services:
+  - type: web
+    name: vibodh-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: SLACK_CLIENT_ID
+        sync: false
+      - key: SLACK_CLIENT_SECRET
+        sync: false
+      - key: SLACK_REDIRECT_URI
+        sync: false
+      - key: CLICKUP_CLIENT_ID
+        sync: false
+      - key: CLICKUP_CLIENT_SECRET
+        sync: false
+      - key: CLICKUP_REDIRECT_URI
+        sync: false
+      - key: ADS_WORKER_ENABLED
+        value: true
+      - key: ADS_SYNC_INTERVAL_HOURS
+        value: 1
+      - key: ADS_ANOMALY_CHECK_TIME
+        value: "4:00"
+      - key: ADS_MOCK_MODE
+        value: true
+      - key: GOOGLE_ADS_DEVELOPER_TOKEN
+        sync: false
+      - key: GOOGLE_ADS_CLIENT_ID
+        sync: false
+      - key: GOOGLE_ADS_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_ADS_REDIRECT_URI
+        sync: false
+      - key: META_ADS_APP_ID
+        sync: false
+      - key: META_ADS_APP_SECRET
+        sync: false
+      - key: META_ADS_REDIRECT_URI
+        sync: false
+      - key: CIL_ENABLED
+        value: true
+      - key: CIL_LEARNING_CYCLE_TIME
+        value: "2:00"
+      - key: CIL_TELEMETRY_INTERVAL_MINUTES
+        value: 5
+      - key: CIL_PROPOSAL_CHECK_INTERVAL_MINUTES
+        value: 15

@@ -13,10 +13,14 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, date
 from supabase import Client
 from app.core.logging import logger
-from app.services.google_ads_service import get_google_ads_service
+from app.services.google_ads_service import get_google_ads_service, reset_google_ads_service
 from app.services.meta_ads_service import get_meta_ads_service
+from app.services.ads_document_service import get_ads_document_service
+from app.services.embedding_service import get_embedding_service
+from app.services.memory_service import get_memory_service
 import uuid
 import time
+import asyncio
 
 
 class AdsIngestionService:
@@ -34,10 +38,36 @@ class AdsIngestionService:
             supabase: Supabase client for data storage
         """
         self.supabase = supabase
+
+        # Reset Google Ads singleton to ensure fresh instance with generator
+        reset_google_ads_service()
+
         self.google_ads_service = get_google_ads_service(supabase)
         self.meta_ads_service = get_meta_ads_service(supabase)
 
         logger.info("Ads Ingestion Service initialized")
+
+    def _run_async(self, coro):
+        """
+        Helper to run async coroutine from sync context.
+
+        Args:
+            coro: Coroutine to run
+
+        Returns:
+            Result of the coroutine
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If event loop is already running, schedule as task
+                asyncio.create_task(coro)
+            else:
+                # If no event loop, run directly
+                return loop.run_until_complete(coro)
+        except RuntimeError:
+            # No event loop exists, create one
+            return asyncio.run(coro)
 
     def connect_google_ads_account(
         self,
@@ -260,14 +290,20 @@ class AdsIngestionService:
         errors = []
 
         try:
-            # Get access token from connection
-            connection = self.supabase.table("connections")\
-                .select("access_token")\
-                .eq("id", account_data["connection_id"])\
-                .single()\
-                .execute()
+            # Get access token from connection (or use mock token if no connection)
+            if account_data.get("connection_id"):
+                # Production mode: read from connections table
+                connection = self.supabase.table("connections")\
+                    .select("access_token")\
+                    .eq("id", account_data["connection_id"])\
+                    .single()\
+                    .execute()
 
-            access_token = connection.data["access_token"]
+                access_token = connection.data["access_token"]
+            else:
+                # Mock/simulated mode: use dummy token
+                logger.info(f"[MOCK] No connection_id, using mock access token")
+                access_token = "mock_access_token"
 
             # Sync campaigns
             if platform == "google_ads":
@@ -392,9 +428,42 @@ class AdsIngestionService:
                         .update(campaign_data)\
                         .eq("id", existing.data[0]["id"])\
                         .execute()
+                    campaign_db_id = existing.data[0]["id"]
                 else:
                     # Insert
-                    self.supabase.table("ad_campaigns").insert(campaign_data).execute()
+                    result = self.supabase.table("ad_campaigns").insert(campaign_data).execute()
+                    campaign_db_id = result.data[0]["id"]
+
+                # Create document and embedding for semantic search
+                try:
+                    self._create_campaign_document(campaign_db_id, org_id, campaign_data)
+                except Exception as doc_error:
+                    logger.error(f"[GOOGLE_ADS] Failed to create document for campaign {campaign_db_id}: {doc_error}")
+
+                # Create memory for campaign event
+                try:
+                    # Get latest metrics for memory context
+                    latest_metrics = self.supabase.table("ad_metrics")\
+                        .select("*")\
+                        .eq("campaign_id", campaign_db_id)\
+                        .order("metric_date", desc=True)\
+                        .limit(1)\
+                        .execute()
+
+                    metrics = latest_metrics.data[0] if latest_metrics.data else None
+                    is_new_campaign = not bool(existing.data)
+
+                    self._run_async(
+                        self._create_campaign_memory(
+                            campaign_db_id=campaign_db_id,
+                            org_id=org_id,
+                            campaign_data=campaign_data,
+                            metrics=metrics,
+                            is_new=is_new_campaign
+                        )
+                    )
+                except Exception as mem_error:
+                    logger.error(f"[GOOGLE_ADS] Failed to create memory for campaign {campaign_db_id}: {mem_error}")
 
                 synced_count += 1
 
@@ -513,9 +582,42 @@ class AdsIngestionService:
                         .update(campaign_data)\
                         .eq("id", existing.data[0]["id"])\
                         .execute()
+                    campaign_db_id = existing.data[0]["id"]
                 else:
                     # Insert
-                    self.supabase.table("ad_campaigns").insert(campaign_data).execute()
+                    result = self.supabase.table("ad_campaigns").insert(campaign_data).execute()
+                    campaign_db_id = result.data[0]["id"]
+
+                # Create document and embedding for semantic search
+                try:
+                    self._create_campaign_document(campaign_db_id, org_id, campaign_data)
+                except Exception as doc_error:
+                    logger.error(f"[META_ADS] Failed to create document for campaign {campaign_db_id}: {doc_error}")
+
+                # Create memory for campaign event
+                try:
+                    # Get latest metrics for memory context
+                    latest_metrics = self.supabase.table("ad_metrics")\
+                        .select("*")\
+                        .eq("campaign_id", campaign_db_id)\
+                        .order("metric_date", desc=True)\
+                        .limit(1)\
+                        .execute()
+
+                    metrics = latest_metrics.data[0] if latest_metrics.data else None
+                    is_new_campaign = not bool(existing.data)
+
+                    self._run_async(
+                        self._create_campaign_memory(
+                            campaign_db_id=campaign_db_id,
+                            org_id=org_id,
+                            campaign_data=campaign_data,
+                            metrics=metrics,
+                            is_new=is_new_campaign
+                        )
+                    )
+                except Exception as mem_error:
+                    logger.error(f"[META_ADS] Failed to create memory for campaign {campaign_db_id}: {mem_error}")
 
                 synced_count += 1
 
@@ -614,6 +716,268 @@ class AdsIngestionService:
                 logger.error(f"[META_ADS] Failed to sync metrics for campaign {campaign['campaign_id']}: {e}")
 
         return synced_count
+
+    async def _create_campaign_memory(
+        self,
+        campaign_db_id: str,
+        org_id: str,
+        campaign_data: Dict[str, Any],
+        metrics: Optional[Dict[str, Any]] = None,
+        is_new: bool = False
+    ) -> None:
+        """
+        Create memory records for campaign events and insights.
+
+        Args:
+            campaign_db_id: Database ID of the campaign
+            org_id: Organization ID
+            campaign_data: Campaign data dict
+            metrics: Latest metrics for the campaign
+            is_new: Whether this is a newly created campaign
+        """
+        try:
+            memory_service = get_memory_service(self.supabase)
+            platform = campaign_data.get("platform", "unknown")
+            campaign_name = campaign_data.get("campaign_name", "Unnamed Campaign")
+            status = campaign_data.get("status", "unknown")
+
+            # Determine memory type and importance based on event
+            if is_new:
+                # New campaign launch - store as "update" memory
+                title = f"New {platform.replace('_', ' ').title()} Campaign: {campaign_name}"
+                content = f"Campaign '{campaign_name}' launched on {platform.replace('_', ' ').title()} with status: {status}"
+
+                if campaign_data.get("objective"):
+                    content += f"\nObjective: {campaign_data['objective']}"
+                if campaign_data.get("budget_amount"):
+                    content += f"\nBudget: {campaign_data['budget_amount']} {campaign_data.get('currency', 'USD')}"
+
+                await memory_service.store_memory(
+                    org_id=org_id,
+                    title=title,
+                    content=content,
+                    memory_type="update",
+                    importance=0.6,
+                    source_refs=[{"campaign_id": campaign_db_id, "platform": platform}],
+                    metadata={
+                        "campaign_id": campaign_db_id,
+                        "platform": platform,
+                        "event_type": "campaign_launch"
+                    }
+                )
+                logger.info(f"[MEMORY] Created launch memory for campaign {campaign_name}")
+
+            # Check for performance milestones
+            if metrics:
+                roas = float(metrics.get("roas", 0) or 0)
+                conversions = int(metrics.get("conversions", 0) or 0)
+
+                # High performance - create insight memory
+                # Adjusted thresholds: ROAS >= 4.0 OR (ROAS >= 3.0 AND conversions >= 10)
+                is_high_performer = (roas >= 4.0) or (roas >= 3.0 and conversions >= 10)
+
+                if is_high_performer:
+                    title = f"High-Performing Campaign: {campaign_name}"
+                    content = f"Campaign '{campaign_name}' on {platform.replace('_', ' ').title()} is performing exceptionally well:\n"
+                    content += f"- ROAS: {roas:.2f}x\n"
+                    content += f"- Conversions: {conversions}\n"
+                    content += f"- CTR: {metrics.get('ctr', 0):.2f}%\n"
+                    content += f"\nThis campaign could be worth replicating or scaling up budget."
+
+                    await memory_service.store_memory(
+                        org_id=org_id,
+                        title=title,
+                        content=content,
+                        memory_type="insight",
+                        importance=0.9,  # High importance for high performers
+                        source_refs=[{"campaign_id": campaign_db_id, "platform": platform}],
+                        metadata={
+                            "campaign_id": campaign_db_id,
+                            "platform": platform,
+                            "event_type": "high_performance",
+                            "roas": roas,
+                            "conversions": conversions
+                        }
+                    )
+                    logger.info(f"[MEMORY] Created high-performance insight for campaign {campaign_name}")
+
+                # Poor performance - create insight memory
+                elif roas < 1.0 and conversions < 10:
+                    title = f"Underperforming Campaign Alert: {campaign_name}"
+                    content = f"Campaign '{campaign_name}' on {platform.replace('_', ' ').title()} is underperforming:\n"
+                    content += f"- ROAS: {roas:.2f}x (below 1.0 - losing money)\n"
+                    content += f"- Conversions: {conversions}\n"
+                    content += f"- CTR: {metrics.get('ctr', 0):.2f}%\n"
+                    content += f"\nConsider pausing this campaign or adjusting targeting/creative."
+
+                    await memory_service.store_memory(
+                        org_id=org_id,
+                        title=title,
+                        content=content,
+                        memory_type="insight",
+                        importance=0.8,  # High importance for issues
+                        source_refs=[{"campaign_id": campaign_db_id, "platform": platform}],
+                        metadata={
+                            "campaign_id": campaign_db_id,
+                            "platform": platform,
+                            "event_type": "poor_performance",
+                            "roas": roas,
+                            "conversions": conversions
+                        }
+                    )
+                    logger.info(f"[MEMORY] Created underperformance alert for campaign {campaign_name}")
+
+            # Status change - create update memory
+            if status in ["paused", "ended", "deleted"]:
+                title = f"Campaign Status Change: {campaign_name}"
+                content = f"Campaign '{campaign_name}' on {platform.replace('_', ' ').title()} status changed to: {status}"
+
+                if metrics:
+                    content += f"\n\nFinal Performance:"
+                    content += f"\n- ROAS: {metrics.get('roas', 0):.2f}x"
+                    content += f"\n- Total Conversions: {metrics.get('conversions', 0)}"
+                    content += f"\n- Total Spend: {metrics.get('spend', 0):.2f}"
+
+                await memory_service.store_memory(
+                    org_id=org_id,
+                    title=title,
+                    content=content,
+                    memory_type="update",
+                    importance=0.5,
+                    source_refs=[{"campaign_id": campaign_db_id, "platform": platform}],
+                    metadata={
+                        "campaign_id": campaign_db_id,
+                        "platform": platform,
+                        "event_type": "status_change",
+                        "new_status": status
+                    }
+                )
+                logger.info(f"[MEMORY] Created status change memory for campaign {campaign_name}")
+
+        except Exception as e:
+            logger.error(f"Failed to create campaign memory: {e}", exc_info=True)
+            # Don't raise - memory creation failures shouldn't block campaign ingestion
+
+    def _create_campaign_document(
+        self,
+        campaign_db_id: str,
+        org_id: str,
+        campaign_data: Dict[str, Any]
+    ) -> None:
+        """
+        Create a searchable document and embedding for a campaign.
+
+        Args:
+            campaign_db_id: Database ID of the campaign (UUID)
+            org_id: Organization ID
+            campaign_data: Campaign data dict
+        """
+        try:
+            # Get latest metrics for this campaign
+            latest_metrics = self.supabase.table("ad_metrics")\
+                .select("*")\
+                .eq("campaign_id", campaign_db_id)\
+                .order("metric_date", desc=True)\
+                .limit(1)\
+                .execute()
+
+            metrics = latest_metrics.data[0] if latest_metrics.data else None
+
+            # Convert campaign to document format
+            doc_service = get_ads_document_service()
+            doc_content = doc_service.campaign_to_document(campaign_data, metrics)
+
+            platform = campaign_data["platform"]
+            campaign_id = campaign_data["campaign_id"]
+
+            # Check if document already exists for this campaign
+            existing_doc = self.supabase.table("documents")\
+                .select("id")\
+                .eq("org_id", org_id)\
+                .eq("source_type", platform)\
+                .eq("source_id", campaign_id)\
+                .execute()
+
+            document_record = {
+                "org_id": org_id,
+                "source_type": platform,
+                "source_id": campaign_id,
+                "title": doc_content["title"],
+                "content": doc_content["content"],
+                "summary": doc_content["summary"],
+                "metadata": {
+                    "campaign_id": campaign_db_id,
+                    "campaign_name": campaign_data["campaign_name"],
+                    "platform": platform,
+                    "status": campaign_data["status"],
+                    "objective": campaign_data.get("objective"),
+                    "type": "ad_campaign"
+                },
+                "embedding_status": "pending",
+                "updated_at": datetime.utcnow().isoformat()
+            }
+
+            if existing_doc.data:
+                # Update existing document
+                self.supabase.table("documents")\
+                    .update(document_record)\
+                    .eq("id", existing_doc.data[0]["id"])\
+                    .execute()
+                document_id = existing_doc.data[0]["id"]
+                logger.info(f"[{platform.upper()}] Updated document for campaign {campaign_id}")
+            else:
+                # Create new document
+                result = self.supabase.table("documents")\
+                    .insert(document_record)\
+                    .execute()
+                document_id = result.data[0]["id"]
+                logger.info(f"[{platform.upper()}] Created document for campaign {campaign_id}")
+
+            # Generate embedding
+            embedding_service = get_embedding_service()
+            embedding_vector = embedding_service.generate_embedding(doc_content["content"])
+
+            # Check if embedding already exists
+            existing_embedding = self.supabase.table("embeddings")\
+                .select("id")\
+                .eq("document_id", document_id)\
+                .execute()
+
+            embedding_record = {
+                "org_id": org_id,
+                "document_id": document_id,
+                "content": doc_content["content"],
+                "embedding": embedding_vector,
+                "metadata": {
+                    "source": "ad_campaign",
+                    "platform": platform,
+                    "campaign_id": campaign_db_id
+                }
+            }
+
+            if existing_embedding.data:
+                # Update existing embedding
+                self.supabase.table("embeddings")\
+                    .update(embedding_record)\
+                    .eq("id", existing_embedding.data[0]["id"])\
+                    .execute()
+                logger.info(f"[{platform.upper()}] Updated embedding for campaign {campaign_id}")
+            else:
+                # Create new embedding
+                self.supabase.table("embeddings")\
+                    .insert(embedding_record)\
+                    .execute()
+                logger.info(f"[{platform.upper()}] Created embedding for campaign {campaign_id}")
+
+            # Mark document as completed
+            self.supabase.table("documents")\
+                .update({"embedding_status": "completed"})\
+                .eq("id", document_id)\
+                .execute()
+
+        except Exception as e:
+            logger.error(f"Failed to create campaign document: {e}", exc_info=True)
+            raise
 
 
 # Singleton instance

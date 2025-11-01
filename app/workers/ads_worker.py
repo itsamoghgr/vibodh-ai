@@ -40,7 +40,7 @@ class AdsWorker:
 
         self.scheduler = AsyncIOScheduler()
         self.supabase = get_supabase_admin_client()
-        self.ads_ingestion_service = get_ads_ingestion_service()
+        self.ads_ingestion_service = get_ads_ingestion_service(self.supabase)
 
         self._is_running = False
         self._sync_failures = {}  # Track consecutive failures per org
@@ -215,9 +215,11 @@ class AdsWorker:
 
             try:
                 # Use existing ingestion service
-                result = await self.ads_ingestion_service.ingest_account_data(
+                result = self.ads_ingestion_service.sync_account_data(
                     account_id=account_id,
-                    days_back=7  # Sync last 7 days for updates
+                    org_id=org_id,
+                    days_back=7,  # Sync last 7 days for updates
+                    force_refresh=False
                 )
 
                 campaigns_synced = result.get('campaigns_synced', 0)

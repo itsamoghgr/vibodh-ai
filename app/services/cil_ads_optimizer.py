@@ -141,30 +141,28 @@ class CILAdsOptimizer:
                 confidence = min(0.95, 0.7 + (best_roas - worst_roas) / 10.0)
 
                 proposal = {
-                    'id': str(uuid.uuid4()),
                     'org_id': org_id,
                     'learning_cycle_id': learning_cycle_id,
                     'proposal_type': 'platform_shift',
-                    'proposed_policy_config': None,  # Not a policy change
+                    'proposed_policy_config': {},  # Not a policy change
                     'change_type': 'minor' if confidence >= 0.8 else 'major',
                     'change_details': {
                         'from_platform': worst_platform['platform'],
                         'to_platform': best_platform['platform'],
                         'from_roas': worst_roas,
                         'to_roas': best_roas,
-                        'recommendation': f"Shift budget from {worst_platform['platform']} to {best_platform['platform']}"
+                        'recommendation': f"Shift budget from {worst_platform['platform']} to {best_platform['platform']}",
+                        'impact_summary': f"{best_platform['platform']} shows {expected_gain:.1f}% better ROAS"
                     },
+                    'change_reason': f"{best_platform['platform']} shows {expected_gain:.1f}% better ROAS than {worst_platform['platform']}",
                     'ads_context': {
                         'platforms_compared': [p['platform'] for p in platforms],
                         'performance_delta': best_roas - worst_roas,
                         'best_platform_campaigns': best_platform.get('total_campaigns'),
                         'worst_platform_campaigns': worst_platform.get('total_campaigns')
                     },
-                    'confidence_score': round(confidence, 2),
                     'expected_gain': round(expected_gain, 2),
                     'risk_level': 'low' if confidence >= 0.85 else 'medium',
-                    'impact_summary': f"{best_platform['platform']} shows {expected_gain:.1f}% better ROAS",
-                    'recommendation': f"Consider allocating more budget to {best_platform['platform']}",
                     'status': 'pending',
                     'auto_apply_after': (datetime.utcnow() + timedelta(hours=24)).isoformat() if confidence >= 0.8 else None
                 }
@@ -313,19 +311,21 @@ class CILAdsOptimizer:
                 confidence = 0.85 if len(issues) >= 2 else 0.75
 
                 proposal = {
-                    'id': str(uuid.uuid4()),
                     'org_id': org_id,
                     'learning_cycle_id': learning_cycle_id,
                     'proposal_type': 'pause_campaign',
-                    'proposed_policy_config': None,
+                    'proposed_policy_config': {},
                     'change_type': 'minor' if confidence >= 0.8 else 'major',
                     'change_details': {
                         'campaign_id': campaign['campaign_id'],
                         'campaign_name': campaign['campaign_name'],
                         'platform': campaign['platform'],
                         'issues': issues,
-                        'days_underperforming': campaign.get('days_underperforming', 0)
+                        'days_underperforming': campaign.get('days_underperforming', 0),
+                        'recommendation': f"Pause {campaign['campaign_name']} to stop losses",
+                        'impact_summary': f"Campaign failing on {len(issues)} metrics: {', '.join(issues)}"
                     },
+                    'change_reason': f"Underperforming campaign: {', '.join(issues)}",
                     'ads_context': {
                         'current_metrics': {
                             'ctr': ctr,
@@ -334,11 +334,8 @@ class CILAdsOptimizer:
                             'spend': campaign.get('spend')
                         }
                     },
-                    'confidence_score': confidence,
                     'expected_gain': 0.0,  # Preventing loss
                     'risk_level': 'low',
-                    'impact_summary': f"Campaign failing on {len(issues)} metrics: {', '.join(issues)}",
-                    'recommendation': f"Pause {campaign['campaign_name']} to stop losses",
                     'status': 'pending',
                     'auto_apply_after': (datetime.utcnow() + timedelta(hours=24)).isoformat() if confidence >= 0.8 else None
                 }
@@ -396,18 +393,20 @@ class CILAdsOptimizer:
                 confidence = min(0.90, 0.65 + performance_score * 0.25)
 
                 proposal = {
-                    'id': str(uuid.uuid4()),
                     'org_id': org_id,
                     'learning_cycle_id': learning_cycle_id,
                     'proposal_type': 'clone_campaign',
-                    'proposed_policy_config': None,
+                    'proposed_policy_config': {},  # Empty for clone campaigns
                     'change_type': 'major',  # Cloning requires approval
                     'change_details': {
                         'source_campaign_id': campaign['campaign_id'],
                         'source_campaign_name': campaign['campaign_name'],
                         'platform': campaign['platform'],
-                        'clone_reason': 'high_performance'
+                        'clone_reason': 'high_performance',
+                        'recommendation': f"Clone {campaign['campaign_name']} to scale success",
+                        'impact_summary': f"Top performer (ROAS: {roas:.2f}x, CTR: {ctr:.2f}%, Score: {performance_score:.2f})"
                     },
+                    'change_reason': f"High performance detected: ROAS {roas:.2f}x, CTR {ctr:.2f}%",
                     'ads_context': {
                         'source_metrics': {
                             'roas': roas,
@@ -416,11 +415,8 @@ class CILAdsOptimizer:
                             'performance_score': performance_score
                         }
                     },
-                    'confidence_score': round(confidence, 2),
                     'expected_gain': 50.0,  # Estimate: clone could add 50% more results
                     'risk_level': 'medium',
-                    'impact_summary': f"Top performer (ROAS: {roas:.2f}x, CTR: {ctr:.2f}%, Score: {performance_score:.2f})",
-                    'recommendation': f"Clone {campaign['campaign_name']} to scale success",
                     'status': 'pending',
                     'auto_apply_after': None  # Requires manual approval
                 }
